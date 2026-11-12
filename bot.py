@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import sqlite3
-
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
@@ -13,14 +12,14 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
 )
 from aiogram.exceptions import TelegramAPIError
 
 
-# ==========================================
-# QUANTUM TRADE AI
-# ==========================================
+# =========================================================
+# QUANTUM TRADE AI — CONFIGURATION
+# =========================================================
 
 TOKEN_USER = os.getenv("TOKEN_USER", "").strip()
 TOKEN_ADMIN = os.getenv("TOKEN_ADMIN", "").strip()
@@ -28,25 +27,24 @@ TOKEN_ADMIN = os.getenv("TOKEN_ADMIN", "").strip()
 OWNER_ID = 770710937
 DEFAULT_ADMIN_ID = 5232049751
 
-# ID канала SIGNALS PRO
+# Numeric ID of the source Telegram channel SIGNALS PRO.
 SOURCE_CHANNEL_ID = -1003979525371
 
-DB_PATH = "quantum.db"
+DB_PATH = os.getenv("DB_PATH", "quantum.db")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 log = logging.getLogger("QUANTUM_TRADE_AI")
 
 user_dp = Dispatcher()
 admin_dp = Dispatcher()
 
 
-# ==========================================
-# БАЗА ДАННЫХ
-# ==========================================
+# =========================================================
+# DATABASE
+# =========================================================
 
 def connect_db():
     return sqlite3.connect(DB_PATH, timeout=30)
@@ -58,7 +56,6 @@ def now():
 
 def init_db():
     with connect_db() as conn:
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -70,13 +67,11 @@ def init_db():
                 created_at TEXT
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,7 +83,6 @@ def init_db():
                 created_by INTEGER
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,17 +92,22 @@ def init_db():
                 created_at TEXT
             )
         """)
-
+        # Keeps source-channel post IDs to prevent duplicate broadcasts.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_posts (
+                message_id INTEGER PRIMARY KEY,
+                text TEXT DEFAULT '',
+                created_at TEXT
+            )
+        """)
         conn.execute(
-            "INSERT OR IGNORE INTO admins VALUES (?)",
-            (DEFAULT_ADMIN_ID,)
+            "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
+            (DEFAULT_ADMIN_ID,),
         )
 
 
 def register_user(user):
-
     with connect_db() as conn:
-
         conn.execute("""
             INSERT OR IGNORE INTO users
             (user_id, username, full_name, status,
@@ -118,9 +117,8 @@ def register_user(user):
             user.id,
             user.username or "",
             user.full_name or "",
-            now()
+            now(),
         ))
-
         conn.execute("""
             UPDATE users
             SET username=?, full_name=?
@@ -128,255 +126,198 @@ def register_user(user):
         """, (
             user.username or "",
             user.full_name or "",
-            user.id
+            user.id,
         ))
 
 
 def get_user(user_id):
-
     with connect_db() as conn:
-
         return conn.execute(
             "SELECT * FROM users WHERE user_id=?",
-            (user_id,)
+            (user_id,),
         ).fetchone()
 
 
 def get_status(user_id):
-
     user = get_user(user_id)
-
     return user[3] if user else "active"
 
 
 def set_status(user_id, status):
-
     with connect_db() as conn:
-
         conn.execute("""
-            INSERT OR IGNORE INTO users
-            (user_id, status, created_at)
+            INSERT OR IGNORE INTO users (user_id, status, created_at)
             VALUES (?, ?, ?)
         """, (user_id, status, now()))
-
         conn.execute(
             "UPDATE users SET status=? WHERE user_id=?",
-            (status, user_id)
+            (status, user_id),
         )
 
 
 def is_admin(user_id):
-
     if user_id == OWNER_ID:
         return True
-
     with connect_db() as conn:
-
         result = conn.execute(
             "SELECT 1 FROM admins WHERE user_id=?",
-            (user_id,)
+            (user_id,),
         ).fetchone()
-
     return result is not None
 
 
 def audit(actor, action, target=None):
-
     with connect_db() as conn:
-
         conn.execute("""
-            INSERT INTO audit
-            (actor_id, action, target_id, created_at)
+            INSERT INTO audit (actor_id, action, target_id, created_at)
             VALUES (?, ?, ?, ?)
         """, (actor, action, target, now()))
 
 
-# ==========================================
-# КЛАВИАТУРА
-# ==========================================
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
+# New user menu. Old Forex and calendar handlers are retained below,
+# but these two sections are no longer shown in the main keyboard.
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="⚡ БИНАРНЫЕ ОПЦИОНЫ")],
+        [KeyboardButton(text="🌐 НОВОСТИ")],
         [
-            KeyboardButton(text="📊 FOREX"),
-            KeyboardButton(text="⚡ Бинарные опционы")
+            KeyboardButton(text="📊 СТАТИСТИКА"),
+            KeyboardButton(text="🕘 ИСТОРИЯ СИГНАЛОВ"),
         ],
+        [KeyboardButton(text="🤖 АВТОМАТИЧЕСКИЙ БОТ")],
         [
-            KeyboardButton(text="📰 Новости"),
-            KeyboardButton(text="📅 Экономический календарь")
+            KeyboardButton(text="👤 МОЙ ПРОФИЛЬ"),
+            KeyboardButton(text="⚙️ НАСТРОЙКИ"),
         ],
-        [
-            KeyboardButton(text="📈 Статистика"),
-            KeyboardButton(text="🕘 История сигналов")
-        ],
-        [
-            KeyboardButton(text="🤖 Автоматический бот"),
-            KeyboardButton(text="👤 Мой профиль")
-        ],
-        [
-            KeyboardButton(text="⚙️ Настройки")
-        ]
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
 )
 
 
 def settings_keyboard(enabled):
-
     notification_text = (
-        "🔔 Уведомления: ВКЛ"
-        if enabled else
-        "🔕 Уведомления: ВЫКЛ"
+        "🔔 Уведомления: ВКЛ" if enabled else "🔕 Уведомления: ВЫКЛ"
     )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=notification_text,
-                    callback_data="toggle_notifications"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🇷🇺 Русский",
-                    callback_data="lang_ru"
-                ),
-                InlineKeyboardButton(
-                    text="🇬🇧 English",
-                    callback_data="lang_en"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👤 Мой профиль",
-                    callback_data="profile"
-                )
-            ]
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=notification_text,
+            callback_data="toggle_notifications",
+        )],
+        [
+            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
+            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
+        ],
+        [InlineKeyboardButton(
+            text="👤 Мой профиль",
+            callback_data="profile",
+        )],
+    ])
 
 
 def admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📊 Статистика",
+            callback_data="admin_stats",
+        )],
+        [InlineKeyboardButton(
+            text="👥 Пользователи",
+            callback_data="admin_users",
+        )],
+        [InlineKeyboardButton(
+            text="📨 Управление сигналами",
+            callback_data="admin_signals",
+        )],
+        [InlineKeyboardButton(
+            text="📢 Рассылка",
+            callback_data="admin_broadcast",
+        )],
+        [InlineKeyboardButton(
+            text="🚫 Блокировки",
+            callback_data="admin_blocks",
+        )],
+        [InlineKeyboardButton(
+            text="🛡 Администраторы",
+            callback_data="admin_manage",
+        )],
+        [InlineKeyboardButton(
+            text="📋 Журнал действий",
+            callback_data="admin_audit",
+        )],
+        [InlineKeyboardButton(
+            text="⚙️ Настройки бота",
+            callback_data="admin_settings",
+        )],
+    ])
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="admin_stats"
-                ),
-                InlineKeyboardButton(
-                    text="👥 Пользователи",
-                    callback_data="admin_users"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📨 Сигналы",
-                    callback_data="admin_signals"
-                ),
-                InlineKeyboardButton(
-                    text="📋 Журнал",
-                    callback_data="admin_audit"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="ℹ️ Помощь",
-                    callback_data="admin_help"
-                )
-            ]
-        ]
-    )
 
-
-# ==========================================
-# ПРОВЕРКА ДОСТУПА
-# ==========================================
+# =========================================================
+# ACCESS CHECKS
+# =========================================================
 
 async def check_user(message):
-
     if not message.from_user:
         return False
 
     register_user(message.from_user)
 
-    if get_status(message.from_user.id) in (
-        "blocked",
-        "suspended"
-    ):
-
+    if get_status(message.from_user.id) in ("blocked", "suspended"):
         await message.answer(
-            "⛔ Доступ временно ограничен.\n"
-            "Обратитесь в поддержку."
+            "⛔ Доступ временно ограничен.\nОбратитесь в поддержку."
         )
-
         return False
 
     return True
 
 
 async def check_admin(message):
-
     if not message.from_user:
         return False
-
     if not is_admin(message.from_user.id):
-
-        await message.answer(
-            "⛔ Нет прав администратора."
-        )
-
+        await message.answer("⛔ Нет прав администратора.")
         return False
-
     return True
 
 
 async def check_owner(message):
-
     if not message.from_user:
         return False
-
     if message.from_user.id != OWNER_ID:
-
-        await message.answer(
-            "⛔ Команда доступна только владельцу."
-        )
-
+        await message.answer("⛔ Команда доступна только владельцу.")
         return False
-
     return True
 
 
-# ==========================================
-# ГЛАВНОЕ ПРИВЕТСТВИЕ
-# ==========================================
+# =========================================================
+# USER START AND MAIN MENU
+# =========================================================
 
 async def show_main_menu(message):
-
     await message.answer(
         "💠 QUANTUM TRADE AI\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "Добро пожаловать в будущее "
-        "интеллектуальной торговли!\n\n"
-        "📊 FOREX — аналитика валютного рынка\n"
+        "Добро пожаловать в интеллектуальную торговую платформу!\n\n"
         "⚡ Бинарные опционы\n"
-        "📰 Новости финансового рынка\n"
-        "📅 Экономический календарь\n"
-        "📈 Торговая статистика\n"
+        "🌐 Новости финансового рынка\n"
+        "📊 Торговая статистика\n"
         "🕘 История сигналов\n"
         "🤖 Автоматическая торговля\n"
         "👤 Личный кабинет\n"
         "⚙️ Персональные настройки\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Выберите нужный раздел:",
-        reply_markup=main_keyboard
+        reply_markup=main_keyboard,
     )
 
 
 @user_dp.message(Command("start"))
 async def start_handler(message: Message):
+    if not message.from_user:
+        return
 
     register_user(message.from_user)
 
@@ -384,35 +325,29 @@ async def start_handler(message: Message):
         return
 
     loading = await message.answer(
-        "💠 QUANTUM TRADE AI\n\n"
-        "Инициализация системы ░░░░░░ 0%"
+        "💠 QUANTUM TRADE AI\n\nИнициализация системы ░░░░░░ 0%"
     )
 
     stages = [
         "Загрузка ядра системы ▓░░░░░ 20%",
         "Подключение модулей ▓▓▓░░░ 50%",
         "Проверка профиля ▓▓▓▓▓░ 80%",
-        "Система готова ▓▓▓▓▓▓ 100%"
+        "Система готова ▓▓▓▓▓▓ 100%",
     ]
 
     for stage in stages:
-
-        await asyncio.sleep(0.5)
-
-        await loading.edit_text(
-            "💠 QUANTUM TRADE AI\n\n" + stage
-        )
+        await asyncio.sleep(0.25)
+        await loading.edit_text("💠 QUANTUM TRADE AI\n\n" + stage)
 
     await show_main_menu(message)
 
 
-# ==========================================
-# FOREX
-# ==========================================
+# =========================================================
+# LEGACY FOREX HANDLER — KEPT, NOT SHOWN IN NEW MENU
+# =========================================================
 
 @user_dp.message(F.text == "📊 FOREX")
 async def forex_handler(message: Message):
-
     if not await check_user(message):
         return
 
@@ -424,18 +359,19 @@ async def forex_handler(message: Message):
         "📈 Анализ рынка\n"
         "🎯 Торговые сигналы\n"
         "📊 Статистика\n\n"
-        "🟡 Источник реальных котировок "
-        "пока не подключён."
+        "🟡 Источник реальных котировок пока не подключён."
     )
 
 
-# ==========================================
-# БИНАРНЫЕ ОПЦИОНЫ
-# ==========================================
+# =========================================================
+# BINARY OPTIONS
+# =========================================================
 
-@user_dp.message(F.text == "⚡ Бинарные опционы")
+@user_dp.message(F.text.in_({
+    "⚡ БИНАРНЫЕ ОПЦИОНЫ",
+    "⚡ Бинарные опционы",
+}))
 async def options_handler(message: Message):
-
     if not await check_user(message):
         return
 
@@ -444,26 +380,26 @@ async def options_handler(message: Message):
         "━━━━━━━━━━━━━━━━━━\n\n"
         "🎯 АНАЛИТИКА БИНАРНЫХ ОПЦИОНОВ\n\n"
         "📊 Анализ инструментов\n"
-        "🔔 Торговые сигналы\n"
+        "🔔 Торговые сигналы из SIGNALS PRO\n"
         "⏱ Таймфреймы M1 / M5 / M15\n"
         "📈 История сигналов\n"
         "📉 Статистика\n\n"
-        "🟡 Источник сигналов подключён через SIGNALS PRO."
+        "Новые публикации SIGNALS PRO будут автоматически "
+        "поступать в этот бот."
     )
 
 
-# ==========================================
-# НОВОСТИ
-# ==========================================
+# =========================================================
+# NEWS
+# =========================================================
 
-@user_dp.message(F.text == "📰 Новости")
+@user_dp.message(F.text.in_({"🌐 НОВОСТИ", "📰 Новости"}))
 async def news_handler(message: Message):
-
     if not await check_user(message):
         return
 
     await message.answer(
-        "📰 QUANTUM MARKET NEWS\n"
+        "🌐 QUANTUM MARKET NEWS\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "💵 Валютный рынок\n"
         "₿ Криптовалюты\n"
@@ -474,13 +410,12 @@ async def news_handler(message: Message):
     )
 
 
-# ==========================================
-# ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ
-# ==========================================
+# =========================================================
+# LEGACY ECONOMIC CALENDAR — KEPT, NOT SHOWN IN NEW MENU
+# =========================================================
 
 @user_dp.message(F.text == "📅 Экономический календарь")
 async def calendar_handler(message: Message):
-
     if not await check_user(message):
         return
 
@@ -500,65 +435,78 @@ async def calendar_handler(message: Message):
     )
 
 
-# ==========================================
-# СТАТИСТИКА
-# ==========================================
+# =========================================================
+# STATISTICS
+# =========================================================
 
-@user_dp.message(F.text == "📈 Статистика")
+@user_dp.message(F.text.in_({"📊 СТАТИСТИКА", "📈 Статистика"}))
 async def statistics_handler(message: Message):
-
     if not await check_user(message):
         return
 
     with connect_db() as conn:
-
         total = conn.execute(
             "SELECT COUNT(*) FROM signals"
         ).fetchone()[0]
+        source_total = conn.execute(
+            "SELECT COUNT(*) FROM source_posts"
+        ).fetchone()[0]
 
     await message.answer(
-        "📈 QUANTUM PERFORMANCE\n"
+        "📊 QUANTUM PERFORMANCE\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"📨 Опубликовано сигналов: {total}\n\n"
-        "Результаты WIN / LOSS и процент успешности "
-        "будут рассчитываться после подключения "
-        "учёта фактических исходов.\n\n"
-        "⚠️ Непроверенные результаты не отображаются."
+        f"📨 Всего записей сигналов: {total}\n"
+        f"📡 Публикаций из SIGNALS PRO: {source_total}\n\n"
+        "Результаты WIN / LOSS не рассчитываются без "
+        "достоверной фиксации исходов."
     )
 
 
-# ==========================================
-# ИСТОРИЯ СИГНАЛОВ
-# ==========================================
+# =========================================================
+# SIGNAL HISTORY
+# =========================================================
 
-@user_dp.message(F.text == "🕘 История сигналов")
+@user_dp.message(F.text.in_({
+    "🕘 ИСТОРИЯ СИГНАЛОВ",
+    "🕘 История сигналов",
+}))
 async def history_handler(message: Message):
-
     if not await check_user(message):
         return
 
     with connect_db() as conn:
+        channel_rows = conn.execute("""
+            SELECT message_id, text, created_at
+            FROM source_posts
+            ORDER BY message_id DESC
+            LIMIT 10
+        """).fetchall()
 
-        rows = conn.execute("""
-            SELECT id, instrument, direction,
-                   timeframe, details, created_at
+        manual_rows = conn.execute("""
+            SELECT id, instrument, direction, timeframe, details, created_at
             FROM signals
+            WHERE created_by != 0 OR created_by IS NULL
             ORDER BY id DESC
             LIMIT 10
         """).fetchall()
 
-    if not rows:
-
-        await message.answer(
-            "🕘 История сигналов пока пуста."
-        )
-
+    if not channel_rows and not manual_rows:
+        await message.answer("🕘 История сигналов пока пуста.")
         return
 
     text = "🕘 ИСТОРИЯ СИГНАЛОВ\n━━━━━━━━━━━━━━━━━━\n"
 
-    for row in rows:
+    for row in channel_rows:
+        body = (row[1] or "[Публикация без текста]").strip()
+        if len(body) > 500:
+            body = body[:500] + "…"
+        text += (
+            f"\n📡 SIGNALS PRO | пост {row[0]}\n"
+            f"{body}\n"
+            "──────────────\n"
+        )
 
+    for row in manual_rows:
         text += (
             f"\n#{row[0]} | {row[1]}\n"
             f"Направление: {row[2]}\n"
@@ -568,76 +516,64 @@ async def history_handler(message: Message):
             "──────────────\n"
         )
 
-    await message.answer(text)
+    await message.answer(text[:4000])
 
 
-# ==========================================
-# АВТОМАТИЧЕСКИЙ БОТ
-# ==========================================
+# =========================================================
+# AUTOMATIC BOT
+# =========================================================
 
-@user_dp.message(F.text == "🤖 Автоматический бот")
+@user_dp.message(F.text.in_({
+    "🤖 АВТОМАТИЧЕСКИЙ БОТ",
+    "🤖 Автоматический бот",
+}))
 async def autotrade_handler(message: Message):
-
     if not await check_user(message):
         return
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📝 Регистрация в Intrade Bar",
-                    url="https://go.intrade.bar/n4FmpAFBYfvE"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📩 Поддержка брокера",
-                    url="https://t.me/copy_broker_BO_bot"
-                )
-            ]
-        ]
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📝 Регистрация в Intrade Bar",
+            url="https://go.intrade.bar/n4FmpAFBYfvE",
+        )],
+        [InlineKeyboardButton(
+            text="📩 Поддержка брокера",
+            url="https://t.me/copy_broker_BO_bot",
+        )],
+    ])
 
     await message.answer(
-        "🤖 QUANTUM TRADE AI — АВТОТРЕЙД\n"
+        "🤖 QUANTUM TRADE AI — АВТОМАТИЧЕСКИЙ БОТ\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "Для подключения необходимо иметь аккаунт "
-        "у брокера Intrade Bar.\n\n"
-        "Если у вас ещё нет аккаунта, пройдите регистрацию "
+        "Для подключения автоматического бота необходим "
+        "аккаунт у брокера Intrade Bar.\n\n"
+        "Если у вас ещё нет аккаунта — зарегистрируйтесь "
         "по кнопке ниже.\n\n"
-        "Если аккаунт уже есть, обратитесь в поддержку "
-        "брокера и уточните условия подключения "
-        "к партнёрской программе.\n\n"
-        "После этого свяжитесь с администратором "
-        "QUANTUM TRADE AI для получения инструкции.",
-        reply_markup=keyboard
+        "Если аккаунт уже есть — напишите в поддержку брокера "
+        "и уточните условия подключения к партнёрской программе.\n\n"
+        "После этого обратитесь к администратору "
+        "QUANTUM TRADE AI за инструкцией.",
+        reply_markup=keyboard,
     )
 
 
-# ==========================================
-# ЛИЧНЫЙ ПРОФИЛЬ
-# ==========================================
+# =========================================================
+# PROFILE
+# =========================================================
 
-@user_dp.message(F.text == "👤 Мой профиль")
+@user_dp.message(F.text.in_({"👤 МОЙ ПРОФИЛЬ", "👤 Мой профиль"}))
 async def profile_handler(message: Message):
-
     if not await check_user(message):
         return
 
     user = get_user(message.from_user.id)
-
-    username = (
-        "@" + user[1]
-        if user[1]
-        else "не указан"
-    )
-
-    registration = user[6].replace("T", " ")[:16]
+    username = "@" + user[1] if user[1] else "не указан"
+    registration = (user[6] or "").replace("T", " ")[:16]
 
     status = {
         "active": "🟢 ACTIVE",
         "blocked": "🔴 BLOCKED",
-        "suspended": "🟡 SUSPENDED"
+        "suspended": "🟡 SUSPENDED",
     }.get(user[3], user[3])
 
     await message.answer(
@@ -653,74 +589,61 @@ async def profile_handler(message: Message):
     )
 
 
-# ==========================================
-# НАСТРОЙКИ
-# ==========================================
+# =========================================================
+# SETTINGS
+# =========================================================
 
-@user_dp.message(F.text == "⚙️ Настройки")
+@user_dp.message(F.text.in_({"⚙️ НАСТРОЙКИ", "⚙️ Настройки"}))
 async def settings_handler(message: Message):
-
     if not await check_user(message):
         return
 
     user = get_user(message.from_user.id)
-
     await message.answer(
         "⚙️ QUANTUM SETTINGS\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "Персональные настройки аккаунта:",
-        reply_markup=settings_keyboard(bool(user[4]))
+        reply_markup=settings_keyboard(bool(user[4])),
     )
 
 
 @user_dp.callback_query(F.data == "toggle_notifications")
 async def toggle_notifications(callback: CallbackQuery):
-
-    if get_status(callback.from_user.id) != "active":
-        await callback.answer("Доступ ограничен.", show_alert=True)
-        return
-
     user = get_user(callback.from_user.id)
 
-    if not user:
-        await callback.answer("Сначала нажмите /start.", show_alert=True)
+    if not user or user[3] != "active":
+        await callback.answer("Доступ ограничен.", show_alert=True)
         return
 
     enabled = not bool(user[4])
 
     with connect_db() as conn:
-
         conn.execute(
             "UPDATE users SET notifications=? WHERE user_id=?",
-            (int(enabled), callback.from_user.id)
+            (int(enabled), callback.from_user.id),
         )
 
     user = get_user(callback.from_user.id)
-
     await callback.message.edit_reply_markup(
         reply_markup=settings_keyboard(bool(user[4]))
     )
-
     await callback.answer(
-        "Уведомления включены."
-        if enabled else
-        "Уведомления отключены."
+        "Уведомления включены." if enabled else "Уведомления отключены."
     )
 
 
 @user_dp.callback_query(F.data.in_(["lang_ru", "lang_en"]))
 async def language_handler(callback: CallbackQuery):
+    if not get_user(callback.from_user.id):
+        await callback.answer("Сначала нажмите /start.", show_alert=True)
+        return
 
-    language = (
-        "ru" if callback.data == "lang_ru"
-        else "en"
-    )
+    language = "ru" if callback.data == "lang_ru" else "en"
 
     with connect_db() as conn:
-
         conn.execute(
             "UPDATE users SET language=? WHERE user_id=?",
-            (language, callback.from_user.id)
+            (language, callback.from_user.id),
         )
 
     await callback.answer(
@@ -732,7 +655,6 @@ async def language_handler(callback: CallbackQuery):
 
 @user_dp.callback_query(F.data == "profile")
 async def profile_callback(callback: CallbackQuery):
-
     user = get_user(callback.from_user.id)
 
     if not user:
@@ -750,32 +672,53 @@ async def profile_callback(callback: CallbackQuery):
         f"🔐 Статус: {user[3]}\n"
         f"📅 Регистрация: {user[6]}"
     )
-
     await callback.answer()
 
 
-# ==========================================
-# SIGNALS PRO — АВТОМАТИЧЕСКАЯ ПЕРЕСЫЛКА
-# ==========================================
+# =========================================================
+# SIGNALS PRO CHANNEL AUTO-FORWARDING
+# =========================================================
 
 @user_dp.channel_post(F.chat.id == SOURCE_CHANNEL_ID)
-async def signals_pro_handler(message: Message, bot: Bot):
-
+async def signals_pro_channel_handler(message: Message, bot: Bot):
     """
-    Получает новые публикации из SIGNALS PRO
-    и копирует их пользователям QUANTUM TRADE AI.
+    Copies each new channel post from SIGNALS PRO to active users
+    who have started the user bot and enabled notifications.
 
-    Поддерживаются текст, фото, видео и другие
-    типы публикаций, которые поддерживает copy_message.
+    Original post formatting/media are retained by copy_message.
     """
+    post_text = message.text or message.caption or ""
 
-    log.info(
-        "Получена публикация SIGNALS PRO. Message ID: %s",
-        message.message_id
-    )
+    # Atomic insert protects against duplicate processing of the same post.
+    try:
+        with connect_db() as conn:
+            conn.execute("""
+                INSERT INTO source_posts (message_id, text, created_at)
+                VALUES (?, ?, ?)
+            """, (message.message_id, post_text, now()))
+            conn.execute("""
+                INSERT INTO signals
+                (instrument, direction, timeframe, details, created_at, created_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                "SIGNALS PRO",
+                "CHANNEL POST",
+                "-",
+                post_text[:3000],
+                now(),
+                0,
+            ))
+    except sqlite3.IntegrityError:
+        log.info(
+            "SIGNALS PRO post %s was already processed; skipping.",
+            message.message_id,
+        )
+        return
+    except sqlite3.Error:
+        log.exception("Could not save SIGNALS PRO post.")
+        return
 
     with connect_db() as conn:
-
         recipients = conn.execute("""
             SELECT user_id
             FROM users
@@ -785,66 +728,37 @@ async def signals_pro_handler(message: Message, bot: Bot):
     sent = 0
     failed = 0
 
-    for recipient in recipients:
-
-        user_id = recipient[0]
-
+    for (user_id,) in recipients:
         try:
-
             await bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=SOURCE_CHANNEL_ID,
-                message_id=message.message_id
+                message_id=message.message_id,
             )
-
             sent += 1
-
             await asyncio.sleep(0.05)
-
         except TelegramAPIError as error:
-
             failed += 1
-
             log.warning(
-                "Ошибка отправки публикации пользователю %s: %s",
+                "Could not deliver channel post to user %s: %s",
                 user_id,
-                error
+                error,
             )
-
-    # Сохраняем публикацию в историю.
-    post_text = message.text or message.caption or ""
-
-    with connect_db() as conn:
-
-        conn.execute("""
-            INSERT INTO signals
-            (instrument, direction, timeframe, details,
-             created_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            "SIGNALS PRO",
-            "CHANNEL POST",
-            "-",
-            post_text[:3000],
-            now(),
-            0
-        ))
 
     log.info(
-        "SIGNALS PRO: публикация %s обработана. Доставлено: %s. Ошибок: %s",
+        "SIGNALS PRO post %s processed. Delivered=%s Failed=%s",
         message.message_id,
         sent,
-        failed
+        failed,
     )
 
 
-# ==========================================
-# АДМИНИСТРАТИВНЫЙ БОТ
-# ==========================================
+# =========================================================
+# ADMIN BOT — PANEL
+# =========================================================
 
 @admin_dp.message(Command("start", "panel"))
 async def admin_start(message: Message):
-
     if not await check_admin(message):
         return
 
@@ -853,13 +767,12 @@ async def admin_start(message: Message):
         "ПАНЕЛЬ УПРАВЛЕНИЯ\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "Выберите нужный раздел:",
-        reply_markup=admin_keyboard()
+        reply_markup=admin_keyboard(),
     )
 
 
 @admin_dp.message(Command("help"))
 async def admin_help(message: Message):
-
     if not await check_admin(message):
         return
 
@@ -882,32 +795,30 @@ async def admin_help(message: Message):
     )
 
 
-# ==========================================
-# СТАТИСТИКА АДМИНИСТРАТОРА
-# ==========================================
+# =========================================================
+# ADMIN STATISTICS
+# =========================================================
 
 @admin_dp.message(Command("stats"))
 async def admin_stats(message: Message):
-
     if not await check_admin(message):
         return
 
     with connect_db() as conn:
-
         total = conn.execute(
             "SELECT COUNT(*) FROM users"
         ).fetchone()[0]
-
         active = conn.execute(
             "SELECT COUNT(*) FROM users WHERE status='active'"
         ).fetchone()[0]
-
         blocked = conn.execute(
             "SELECT COUNT(*) FROM users WHERE status='blocked'"
         ).fetchone()[0]
-
         signals = conn.execute(
             "SELECT COUNT(*) FROM signals"
+        ).fetchone()[0]
+        channel_posts = conn.execute(
+            "SELECT COUNT(*) FROM source_posts"
         ).fetchone()[0]
 
     await message.answer(
@@ -916,22 +827,21 @@ async def admin_stats(message: Message):
         f"👥 Всего пользователей: {total}\n"
         f"🟢 Активных: {active}\n"
         f"🔴 Заблокированных: {blocked}\n"
-        f"📨 Сигналов: {signals}"
+        f"📨 Записей сигналов: {signals}\n"
+        f"📡 Публикаций SIGNALS PRO: {channel_posts}"
     )
 
 
-# ==========================================
-# ПОЛЬЗОВАТЕЛИ
-# ==========================================
+# =========================================================
+# ADMIN USERS
+# =========================================================
 
 @admin_dp.message(Command("users"))
 async def admin_users(message: Message):
-
     if not await check_admin(message):
         return
 
     with connect_db() as conn:
-
         rows = conn.execute("""
             SELECT user_id, username, full_name, status
             FROM users
@@ -940,15 +850,11 @@ async def admin_users(message: Message):
         """).fetchall()
 
     if not rows:
-
         await message.answer("Пользователей пока нет.")
-
         return
 
     text = "👥 ПОЛЬЗОВАТЕЛИ\n━━━━━━━━━━━━━━━━━━\n"
-
     for row in rows:
-
         text += (
             f"\nID: {row[0]}\n"
             f"Имя: {row[2]}\n"
@@ -956,55 +862,43 @@ async def admin_users(message: Message):
             f"Статус: {row[3]}\n"
         )
 
-    await message.answer(text)
+    await message.answer(text[:4000])
 
 
-# ==========================================
-# ПУБЛИКАЦИЯ СИГНАЛОВ
-# ==========================================
+# =========================================================
+# ADMIN MANUAL SIGNAL PUBLISHING
+# =========================================================
 
 @admin_dp.message(Command("signal"))
 async def publish_signal(message: Message, bot: Bot):
-
     if not await check_admin(message):
         return
 
     parts = (message.text or "").split(maxsplit=4)
 
     if len(parts) < 4:
-
         await message.answer(
             "Формат команды:\n\n"
             "/signal BTC/USDT BUY M5 комментарий\n\n"
-            "Направление: BUY или SELL."
+            "Направление: BUY, SELL, CALL или PUT."
         )
-
         return
 
     instrument = parts[1].upper()
     direction = parts[2].upper()
     timeframe = parts[3].upper()
-
-    details = (
-        parts[4]
-        if len(parts) > 4
-        else "Без комментария"
-    )
+    details = parts[4] if len(parts) > 4 else "Без комментария"
 
     if direction not in ("BUY", "SELL", "CALL", "PUT"):
-
         await message.answer(
             "Направление должно быть BUY, SELL, CALL или PUT."
         )
-
         return
 
     with connect_db() as conn:
-
         cursor = conn.execute("""
             INSERT INTO signals
-            (instrument, direction, timeframe, details,
-             created_at, created_by)
+            (instrument, direction, timeframe, details, created_at, created_by)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             instrument,
@@ -1012,9 +906,8 @@ async def publish_signal(message: Message, bot: Bot):
             timeframe,
             details,
             now(),
-            message.from_user.id
+            message.from_user.id,
         ))
-
         signal_id = cursor.lastrowid
 
         recipients = conn.execute("""
@@ -1032,35 +925,21 @@ async def publish_signal(message: Message, bot: Bot):
         f"📝 Комментарий: {details}\n"
         f"🆔 Сигнал №{signal_id}\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Информационный сигнал. "
-        "Не является гарантией результата."
+        "⚠️ Информационный сигнал. Не является гарантией результата."
     )
 
     sent = 0
     failed = 0
 
-    for recipient in recipients:
-
+    for (user_id,) in recipients:
         try:
-
-            await bot.send_message(
-                recipient[0],
-                text
-            )
-
+            await bot.send_message(user_id, text)
             sent += 1
-
             await asyncio.sleep(0.05)
-
         except TelegramAPIError:
-
             failed += 1
 
-    audit(
-        message.from_user.id,
-        "publish_signal",
-        signal_id
-    )
+    audit(message.from_user.id, "publish_signal", signal_id)
 
     await message.answer(
         f"✅ Сигнал №{signal_id} опубликован.\n\n"
@@ -1069,28 +948,21 @@ async def publish_signal(message: Message, bot: Bot):
     )
 
 
-# ==========================================
-# РАССЫЛКА
-# ==========================================
+# =========================================================
+# ADMIN BROADCAST
+# =========================================================
 
 @admin_dp.message(Command("broadcast"))
 async def broadcast(message: Message, bot: Bot):
-
     if not await check_admin(message):
         return
 
     parts = (message.text or "").split(maxsplit=1)
-
     if len(parts) < 2:
-
-        await message.answer(
-            "Формат:\n/broadcast Текст сообщения"
-        )
-
+        await message.answer("Формат:\n/broadcast Текст сообщения")
         return
 
     with connect_db() as conn:
-
         users = conn.execute("""
             SELECT user_id
             FROM users
@@ -1100,21 +972,12 @@ async def broadcast(message: Message, bot: Bot):
     sent = 0
     failed = 0
 
-    for user in users:
-
+    for (user_id,) in users:
         try:
-
-            await bot.send_message(
-                user[0],
-                parts[1]
-            )
-
+            await bot.send_message(user_id, parts[1])
             sent += 1
-
             await asyncio.sleep(0.05)
-
         except TelegramAPIError:
-
             failed += 1
 
     audit(message.from_user.id, "broadcast")
@@ -1126,42 +989,27 @@ async def broadcast(message: Message, bot: Bot):
     )
 
 
-# ==========================================
-# БЛОКИРОВКА ПОЛЬЗОВАТЕЛЕЙ
-# ==========================================
+# =========================================================
+# ADMIN USER STATUS MANAGEMENT
+# =========================================================
 
 async def change_status(message, status):
-
     if not await check_admin(message):
         return
 
     parts = (message.text or "").split()
-
     if len(parts) != 2 or not parts[1].isdigit():
-
-        await message.answer(
-            "Укажите ID пользователя."
-        )
-
+        await message.answer("Укажите ID пользователя.")
         return
 
     user_id = int(parts[1])
 
     if user_id == OWNER_ID:
-
-        await message.answer(
-            "Нельзя изменять статус владельца."
-        )
-
+        await message.answer("Нельзя изменять статус владельца.")
         return
 
     set_status(user_id, status)
-
-    audit(
-        message.from_user.id,
-        status,
-        user_id
-    )
+    audit(message.from_user.id, status, user_id)
 
     await message.answer(
         f"✅ Статус пользователя {user_id}: {status}"
@@ -1188,18 +1036,16 @@ async def restore_user(message: Message):
     await change_status(message, "active")
 
 
-# ==========================================
-# ЖУРНАЛ
-# ==========================================
+# =========================================================
+# ADMIN AUDIT LOG
+# =========================================================
 
 @admin_dp.message(Command("audit"))
 async def audit_handler(message: Message):
-
     if not await check_admin(message):
         return
 
     with connect_db() as conn:
-
         rows = conn.execute("""
             SELECT actor_id, action, target_id, created_at
             FROM audit
@@ -1208,17 +1054,11 @@ async def audit_handler(message: Message):
         """).fetchall()
 
     if not rows:
-
-        await message.answer(
-            "Журнал действий пока пуст."
-        )
-
+        await message.answer("Журнал действий пока пуст.")
         return
 
     text = "📋 ЖУРНАЛ ДЕЙСТВИЙ\n━━━━━━━━━━━━━━━━━━\n"
-
     for row in rows:
-
         text += (
             f"\nАдминистратор: {row[0]}\n"
             f"Действие: {row[1]}\n"
@@ -1226,29 +1066,25 @@ async def audit_handler(message: Message):
             f"Дата: {row[3]}\n"
         )
 
-    await message.answer(text)
+    await message.answer(text[:4000])
 
 
-# ==========================================
-# УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ
-# ==========================================
+# =========================================================
+# OWNER ADMIN MANAGEMENT
+# =========================================================
 
 @admin_dp.message(Command("adminlist"))
 async def admin_list(message: Message):
-
     if not await check_owner(message):
         return
 
     with connect_db() as conn:
-
         rows = conn.execute(
             "SELECT user_id FROM admins"
         ).fetchall()
 
     text = f"👑 Владелец: {OWNER_ID}\n\n"
-
     for row in rows:
-
         text += f"🛡 Администратор: {row[0]}\n"
 
     await message.answer(text)
@@ -1256,242 +1092,221 @@ async def admin_list(message: Message):
 
 @admin_dp.message(Command("addadmin"))
 async def add_admin(message: Message):
-
     if not await check_owner(message):
         return
 
     parts = (message.text or "").split()
-
     if len(parts) != 2 or not parts[1].isdigit():
-
-        await message.answer(
-            "Формат: /addadmin ID"
-        )
-
+        await message.answer("Формат: /addadmin ID")
         return
 
     user_id = int(parts[1])
 
     with connect_db() as conn:
-
         conn.execute(
-            "INSERT OR IGNORE INTO admins VALUES (?)",
-            (user_id,)
+            "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
+            (user_id,),
         )
 
-    audit(
-        message.from_user.id,
-        "add_admin",
-        user_id
-    )
-
-    await message.answer(
-        f"✅ Администратор {user_id} добавлен."
-    )
+    audit(message.from_user.id, "add_admin", user_id)
+    await message.answer(f"✅ Администратор {user_id} добавлен.")
 
 
 @admin_dp.message(Command("removeadmin"))
 async def remove_admin(message: Message):
-
     if not await check_owner(message):
         return
 
     parts = (message.text or "").split()
-
     if len(parts) != 2 or not parts[1].isdigit():
-
-        await message.answer(
-            "Формат: /removeadmin ID"
-        )
-
+        await message.answer("Формат: /removeadmin ID")
         return
 
     user_id = int(parts[1])
 
-    if user_id == OWNER_ID:
-
+    if user_id in (OWNER_ID, DEFAULT_ADMIN_ID):
         await message.answer(
-            "Нельзя удалить владельца."
+            "Нельзя удалить владельца или администратора по умолчанию."
         )
-
         return
 
     with connect_db() as conn:
-
         conn.execute(
             "DELETE FROM admins WHERE user_id=?",
-            (user_id,)
+            (user_id,),
         )
 
-    audit(
-        message.from_user.id,
-        "remove_admin",
-        user_id
-    )
-
-    await message.answer(
-        f"✅ Права администратора {user_id} сняты."
-    )
+    audit(message.from_user.id, "remove_admin", user_id)
+    await message.answer(f"✅ Права администратора {user_id} сняты.")
 
 
-# ==========================================
-# КНОПКИ АДМИН-ПАНЕЛИ
-# ==========================================
+# =========================================================
+# ADMIN PANEL BUTTON CALLBACKS
+# =========================================================
 
 @admin_dp.callback_query(F.data.startswith("admin_"))
 async def admin_buttons(callback: CallbackQuery):
-
     if not is_admin(callback.from_user.id):
-
         await callback.answer(
             "Нет прав администратора.",
-            show_alert=True
+            show_alert=True,
         )
-
         return
 
-    if callback.data == "admin_stats":
+    data = callback.data
 
+    if data == "admin_stats":
         with connect_db() as conn:
-
             total = conn.execute(
                 "SELECT COUNT(*) FROM users"
             ).fetchone()[0]
-
+            active = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE status='active'"
+            ).fetchone()[0]
+            blocked = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE status='blocked'"
+            ).fetchone()[0]
             signals = conn.execute(
                 "SELECT COUNT(*) FROM signals"
             ).fetchone()[0]
+            source_posts = conn.execute(
+                "SELECT COUNT(*) FROM source_posts"
+            ).fetchone()[0]
 
         await callback.message.answer(
-            f"📊 Пользователей: {total}\n"
-            f"📨 Сигналов: {signals}"
+            "📊 СТАТИСТИКА QUANTUM TRADE AI\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Пользователей: {total}\n"
+            f"🟢 Активных: {active}\n"
+            f"🔴 Заблокированных: {blocked}\n"
+            f"📨 Записей сигналов: {signals}\n"
+            f"📡 Публикаций SIGNALS PRO: {source_posts}"
         )
 
-    elif callback.data == "admin_users":
-
+    elif data == "admin_users":
         await callback.message.answer(
-            "Для просмотра пользователей используйте /users"
+            "👥 УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ\n\n"
+            "Используйте команду /users."
         )
 
-    elif callback.data == "admin_signals":
-
+    elif data == "admin_signals":
         with connect_db() as conn:
-
             rows = conn.execute("""
-                SELECT id, instrument, direction, timeframe
+                SELECT id, instrument, direction, timeframe, created_at
                 FROM signals
                 ORDER BY id DESC
                 LIMIT 10
             """).fetchall()
 
         if not rows:
-
-            await callback.message.answer(
-                "Сигналов пока нет."
-            )
-
+            await callback.message.answer("Сигналов пока нет.")
         else:
-
-            text = "📨 ПОСЛЕДНИЕ СИГНАЛЫ\n"
-
+            text = "📨 ПОСЛЕДНИЕ СИГНАЛЫ\n━━━━━━━━━━━━━━━━━━\n"
             for row in rows:
-
                 text += (
-                    f"\n#{row[0]} "
-                    f"{row[1]} "
-                    f"{row[2]} "
-                    f"{row[3]}"
+                    f"\n#{row[0]} {row[1]} {row[2]} {row[3]}\n"
+                    f"{row[4]}\n"
                 )
+            text += (
+                "\nДля ручной публикации:\n"
+                "/signal BTC/USDT BUY M5 комментарий"
+            )
+            await callback.message.answer(text[:4000])
 
-            await callback.message.answer(text)
-
-    elif callback.data == "admin_audit":
-
+    elif data == "admin_broadcast":
         await callback.message.answer(
-            "Для просмотра журнала используйте /audit"
+            "📢 РАССЫЛКА\n\n"
+            "Формат:\n/broadcast Текст сообщения"
         )
 
-    elif callback.data == "admin_help":
+    elif data == "admin_blocks":
+        await callback.message.answer(
+            "🚫 УПРАВЛЕНИЕ ДОСТУПОМ\n\n"
+            "/ban ID — блокировка\n"
+            "/unban ID — разблокировка\n"
+            "/suspend ID — приостановка\n"
+            "/restore ID — восстановление"
+        )
+
+    elif data == "admin_manage":
+        if callback.from_user.id != OWNER_ID:
+            await callback.answer(
+                "Управлять администраторами может только владелец.",
+                show_alert=True,
+            )
+            return
 
         await callback.message.answer(
-            "Используйте /help для списка команд."
+            "🛡 УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ\n\n"
+            "/adminlist — список\n"
+            "/addadmin ID — добавить\n"
+            "/removeadmin ID — удалить"
+        )
+
+    elif data == "admin_audit":
+        await callback.message.answer(
+            "📋 ЖУРНАЛ ДЕЙСТВИЙ\n\nИспользуйте команду /audit."
+        )
+
+    elif data == "admin_settings":
+        await callback.message.answer(
+            "⚙️ НАСТРОЙКИ БОТА\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📡 Канал SIGNALS PRO:\n{SOURCE_CHANNEL_ID}\n\n"
+            "Бот получает новые публикации канала автоматически."
         )
 
     await callback.answer()
 
 
-# ==========================================
-# ЗАПУСК ДВУХ БОТОВ
-# ==========================================
+# =========================================================
+# RUN BOTH BOTS
+# =========================================================
 
 async def main():
-
     init_db()
 
     if not TOKEN_USER:
-
-        raise RuntimeError(
-            "Не задан GitHub Secret TOKEN_USER"
-        )
+        raise RuntimeError("Не задан GitHub Secret TOKEN_USER")
 
     if not TOKEN_ADMIN:
-
-        raise RuntimeError(
-            "Не задан GitHub Secret TOKEN_ADMIN"
-        )
+        raise RuntimeError("Не задан GitHub Secret TOKEN_ADMIN")
 
     user_bot = Bot(token=TOKEN_USER)
-
     admin_bot = Bot(token=TOKEN_ADMIN)
 
     try:
-
         user_info, admin_info = await asyncio.gather(
             user_bot.get_me(),
-            admin_bot.get_me()
+            admin_bot.get_me(),
         )
 
-        log.info(
-            "Пользовательский бот: @%s",
-            user_info.username
-        )
+        log.info("Пользовательский бот: @%s", user_info.username)
+        log.info("Административный бот: @%s", admin_info.username)
+        log.info("Источник SIGNALS PRO: %s", SOURCE_CHANNEL_ID)
 
-        log.info(
-            "Административный бот: @%s",
-            admin_info.username
-        )
-
-        log.info(
-            "QUANTUM TRADE AI успешно запущен."
-        )
-
-        # Проверяем, что пользовательский бот является администратором канала.
+        # Verify that the USER bot is an administrator of the source channel.
         try:
             member = await user_bot.get_chat_member(
                 SOURCE_CHANNEL_ID,
-                user_info.id
+                user_info.id,
             )
-            log.info(
-                "Статус бота в SIGNALS PRO: %s",
-                member.status
-            )
+            log.info("Статус пользовательского бота в канале: %s", member.status)
         except TelegramAPIError:
             log.exception(
                 "Не удалось проверить доступ к SIGNALS PRO. "
-                "Проверьте ID канала и права бота."
+                "Проверьте ID канала и права пользовательского бота."
             )
 
         await asyncio.gather(
             user_dp.start_polling(user_bot),
-            admin_dp.start_polling(admin_bot)
+            admin_dp.start_polling(admin_bot),
         )
 
     finally:
-
         await user_bot.session.close()
         await admin_bot.session.close()
 
 
 if __name__ == "__main__":
-
     asyncio.run(main())
