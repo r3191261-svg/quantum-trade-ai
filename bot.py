@@ -13,6 +13,7 @@ from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    FSInputFile,
 )
 from aiogram.exceptions import TelegramAPIError
 
@@ -31,6 +32,8 @@ DEFAULT_ADMIN_ID = 5232049751
 SOURCE_CHANNEL_ID = -1003979525371
 
 DB_PATH = os.getenv("DB_PATH", "quantum.db")
+INTRO_GIF_PATH = os.getenv("INTRO_GIF_PATH", "assets/quantum_trade_ai_intro.gif")
+INTRO_GIF_FILE_ID = os.getenv("INTRO_GIF_FILE_ID", "").strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,6 +103,9 @@ def init_db():
                 created_at TEXT
             )
         """)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "signals_consent" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN signals_consent INTEGER DEFAULT -1")
         conn.execute(
             "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
             (DEFAULT_ADMIN_ID,),
@@ -198,60 +204,32 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 
+def colored_button(text, callback_data, style="primary"):
+    return InlineKeyboardButton(text=text, callback_data=callback_data, style=style)
+
+
 def settings_keyboard(enabled):
-    notification_text = (
-        "🔔 Уведомления: ВКЛ" if enabled else "🔕 Уведомления: ВЫКЛ"
-    )
+    notification_text = "🔔 Уведомления: ВКЛ" if enabled else "🔕 Уведомления: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=notification_text,
-            callback_data="toggle_notifications",
-        )],
+        [colored_button(notification_text, "toggle_notifications", "primary")],
         [
-            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
-            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
+            colored_button("🇷🇺 Русский", "lang_ru", "primary"),
+            colored_button("🇬🇧 English", "lang_en", "primary"),
         ],
-        [InlineKeyboardButton(
-            text="👤 Мой профиль",
-            callback_data="profile",
-        )],
+        [colored_button("👤 Мой профиль", "profile", "primary")],
     ])
 
 
 def admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📊 Статистика",
-            callback_data="admin_stats",
-        )],
-        [InlineKeyboardButton(
-            text="👥 Пользователи",
-            callback_data="admin_users",
-        )],
-        [InlineKeyboardButton(
-            text="📨 Управление сигналами",
-            callback_data="admin_signals",
-        )],
-        [InlineKeyboardButton(
-            text="📢 Рассылка",
-            callback_data="admin_broadcast",
-        )],
-        [InlineKeyboardButton(
-            text="🚫 Блокировки",
-            callback_data="admin_blocks",
-        )],
-        [InlineKeyboardButton(
-            text="🛡 Администраторы",
-            callback_data="admin_manage",
-        )],
-        [InlineKeyboardButton(
-            text="📋 Журнал действий",
-            callback_data="admin_audit",
-        )],
-        [InlineKeyboardButton(
-            text="⚙️ Настройки бота",
-            callback_data="admin_settings",
-        )],
+        [colored_button("📊 Статистика", "admin_stats", "primary")],
+        [colored_button("👥 Пользователи", "admin_users", "primary")],
+        [colored_button("📨 Управление сигналами", "admin_signals", "primary")],
+        [colored_button("📢 Рассылка", "admin_broadcast", "primary")],
+        [colored_button("🚫 Блокировки", "admin_blocks", "danger")],
+        [colored_button("🛡 Администраторы", "admin_manage", "primary")],
+        [colored_button("📋 Журнал действий", "admin_audit", "primary")],
+        [colored_button("⚙️ Настройки бота", "admin_settings", "primary")],
     ])
 
 
@@ -318,28 +296,73 @@ async def show_main_menu(message):
 async def start_handler(message: Message):
     if not message.from_user:
         return
-
     register_user(message.from_user)
-
     if not await check_user(message):
         return
 
-    loading = await message.answer(
-        "💠 QUANTUM TRADE AI\n\nИнициализация системы ░░░░░░ 0%"
+    try:
+        if INTRO_GIF_FILE_ID:
+            await message.answer_animation(
+                INTRO_GIF_FILE_ID, caption="💠 <b>QUANTUM TRADE AI</b>"
+            )
+        elif os.path.isfile(INTRO_GIF_PATH):
+            await message.answer_animation(
+                FSInputFile(INTRO_GIF_PATH), caption="💠 <b>QUANTUM TRADE AI</b>"
+            )
+        else:
+            log.warning("Intro GIF not found: %s", INTRO_GIF_PATH)
+    except TelegramAPIError:
+        log.exception("Could not send intro GIF")
+
+    await message.answer(
+        "⚡ <b>QUANTUM TRADE AI</b>\n\n"
+        "<b>Добро пожаловать в интеллектуальную торговую платформу!</b>\n\n"
+        "Хотите получать торговые сигналы?"
     )
 
-    stages = [
-        "Загрузка ядра системы ▓░░░░░ 20%",
-        "Подключение модулей ▓▓▓░░░ 50%",
-        "Проверка профиля ▓▓▓▓▓░ 80%",
-        "Система готова ▓▓▓▓▓▓ 100%",
-    ]
+    user = get_user(message.from_user.id)
+    consent = user[7] if user and len(user) > 7 else -1
+    if consent in (0, 1):
+        status = "🟢 СИГНАЛЫ ВКЛЮЧЕНЫ" if consent == 1 else "🔴 СИГНАЛЫ ОТКЛЮЧЕНЫ"
+        await message.answer(status, reply_markup=main_keyboard)
+        return
 
-    for stage in stages:
-        await asyncio.sleep(0.25)
-        await loading.edit_text("💠 QUANTUM TRADE AI\n\n" + stage)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [colored_button("✅ ПРИНЯТЬ", "signals_accept", "success")],
+        [colored_button("❌ ОТКЛОНИТЬ", "signals_decline", "danger")],
+    ])
+    await message.answer(
+        "🔔 <b>Выберите, хотите ли вы получать сигналы.</b>",
+        reply_markup=keyboard,
+    )
 
-    await show_main_menu(message)
+
+@user_dp.callback_query(F.data.in_({"signals_accept", "signals_decline"}))
+async def signal_consent_handler(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user or user[3] != "active":
+        await callback.answer("Доступ ограничен.", show_alert=True)
+        return
+
+    accepted = callback.data == "signals_accept"
+    enabled = 1 if accepted else 0
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE users SET signals_consent=?, notifications=? WHERE user_id=?",
+            (enabled, enabled, callback.from_user.id),
+        )
+
+    status = (
+        "🟢 <b>СИГНАЛЫ ВКЛЮЧЕНЫ</b>\nВы будете получать новые сигналы."
+        if accepted else
+        "🔴 <b>СИГНАЛЫ ОТКЛЮЧЕНЫ</b>\nСигналы отправляться не будут."
+    )
+    await callback.message.edit_text(status)
+    await callback.answer("Выбор сохранён")
+    await callback.message.answer(
+        "💠 <b>Главное меню QUANTUM TRADE AI</b>",
+        reply_markup=main_keyboard,
+    )
 
 
 # =========================================================
@@ -619,8 +642,8 @@ async def toggle_notifications(callback: CallbackQuery):
 
     with connect_db() as conn:
         conn.execute(
-            "UPDATE users SET notifications=? WHERE user_id=?",
-            (int(enabled), callback.from_user.id),
+            "UPDATE users SET notifications=?, signals_consent=? WHERE user_id=?",
+            (int(enabled), int(enabled), callback.from_user.id),
         )
 
     user = get_user(callback.from_user.id)
@@ -722,7 +745,7 @@ async def signals_pro_channel_handler(message: Message, bot: Bot):
         recipients = conn.execute("""
             SELECT user_id
             FROM users
-            WHERE status='active' AND notifications=1
+            WHERE status='active' AND notifications=1 AND signals_consent=1
         """).fetchall()
 
     sent = 0
@@ -913,7 +936,7 @@ async def publish_signal(message: Message, bot: Bot):
         recipients = conn.execute("""
             SELECT user_id
             FROM users
-            WHERE status='active' AND notifications=1
+            WHERE status='active' AND notifications=1 AND signals_consent=1
         """).fetchall()
 
     text = (
@@ -966,7 +989,7 @@ async def broadcast(message: Message, bot: Bot):
         users = conn.execute("""
             SELECT user_id
             FROM users
-            WHERE status='active' AND notifications=1
+            WHERE status='active' AND notifications=1 AND signals_consent=1
         """).fetchall()
 
     sent = 0
@@ -1222,10 +1245,10 @@ async def admin_buttons(callback: CallbackQuery):
     elif data == "admin_blocks":
         await callback.message.answer(
             "🚫 УПРАВЛЕНИЕ ДОСТУПОМ\n\n"
-            "/ban ID — блокировка\n"
-            "/unban ID — разблокировка\n"
-            "/suspend ID — приостановка\n"
-            "/restore ID — восстановление"
+            "🔴 /ban ID — блокировка\n"
+            "🟢 /unban ID — снять блокировку\n"
+            "🔵 /suspend ID — приостановка\n"
+            "🟢 /restore ID — восстановление"
         )
 
     elif data == "admin_manage":
