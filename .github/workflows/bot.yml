@@ -1,36 +1,43 @@
-name: QUANTUM TRADE AI BOT
+name: Publish QUANTUM TRADE AI
 
 on:
   push:
     branches:
       - main
-
+    paths:
+      - "webapp/**"
+      - ".github/workflows/deploy-pages.yml"
   workflow_dispatch:
 
-  schedule:
-    - cron: "0 */6 * * *"
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
 
 jobs:
-  run-bot:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
     runs-on: ubuntu-latest
-    timeout-minutes: 350
 
     steps:
-      - name: Download project
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Python
-        uses: actions/setup-python@v5
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v3
         with:
-          python-version: "3.12"
+          path: ./webapp
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Start QUANTUM TRADE AI
-        env:
-          TOKEN_USER: ${{ secrets.TOKEN_USER }}
-          TOKEN_ADMIN: ${{ secrets.TOKEN_ADMIN }}
-        run: python bot.py
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4
