@@ -1,0 +1,36 @@
+name: QUANTUM TRADE AI BOT
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: quantum-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install libraries
+        run: pip install -r requirements.txt
+
+      - name: Start QUANTUM TRADE AI
+        env:
+          TOKEN_USER: ${{ secrets.TOKEN_USER }}
+          TOKEN_ADMIN: ${{ secrets.TOKEN_ADMIN }}
+        run: python bot.py
