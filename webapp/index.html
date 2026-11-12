@@ -3,72 +3,344 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="theme-color" content="#050b18">
+<meta name="theme-color" content="#080e1c">
 <title>QUANTUM TRADE AI</title>
+
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <style>
-*{box-sizing:border-box}
-body{
-margin:0;
-padding:22px;
-font-family:Arial,sans-serif;
-color:#fff;
-background:radial-gradient(circle at top,#102c58,#050b18 65%);
+:root {
+  --bg: #080e1c;
+  --panel: #101c32;
+  --blue: #168cff;
+  --cyan: #00d9ff;
+  --purple: #8b5cf6;
+  --green: #00d68f;
+  --red: #ff526b;
+  --text: #f3f7ff;
+  --muted: #91a4c2;
 }
-.logo{text-align:center;font-size:27px;font-weight:bold;color:#49b9ff;margin:25px 0}
-.subtitle{text-align:center;color:#9bb7d8;margin-bottom:30px}
-.card{
-padding:22px;margin:14px 0;border-radius:18px;
-background:linear-gradient(135deg,#10294a,#10182b);
-border:1px solid #237dca;
-box-shadow:0 0 18px #0879cc33;
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 18px;
+  padding-bottom: 35px;
+  background:
+    radial-gradient(circle at 50% 0%, #123568 0%, transparent 40%),
+    var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
 }
-button{
-width:100%;padding:19px;margin:7px 0;
-border:1px solid #278bff;border-radius:14px;
-background:linear-gradient(100deg,#0755bd,#087edb);
-color:white;font-size:16px;font-weight:bold;
+
+.header {
+  padding: 22px 16px;
+  border: 1px solid #1b73c9;
+  border-radius: 22px;
+  background: linear-gradient(135deg,#102d57,#10172b);
+  box-shadow: 0 0 25px #087dff35;
+  text-align: center;
 }
-button:active{transform:scale(.97)}
-h2{color:#50baff}
-.info{color:#a8c2df;line-height:1.5}
+
+.logo {
+  font-size: 27px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  color: white;
+  text-shadow: 0 0 15px var(--cyan);
+}
+
+.subtitle {
+  color: var(--cyan);
+  font-size: 12px;
+  margin-top: 8px;
+  letter-spacing: 2px;
+}
+
+.status {
+  margin-top: 17px;
+  color: var(--green);
+  font-size: 13px;
+}
+
+h2 {
+  font-size: 17px;
+  margin: 25px 0 13px;
+}
+
+.menu {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+button {
+  border: 1px solid #2679d6;
+  border-radius: 16px;
+  padding: 17px 10px;
+  min-height: 82px;
+  background: linear-gradient(145deg,#1266c8,#12356b);
+  color: white;
+  font-size: 14px;
+  font-weight: 700;
+  box-shadow: 0 5px 18px #087dff30;
+  transition: .2s;
+  cursor: pointer;
+}
+
+button:active {
+  transform: scale(.96);
+  box-shadow: 0 0 22px #00c8ff80;
+}
+
+button.purple {
+  background: linear-gradient(145deg,#7041ce,#30205f);
+  border-color: #a17aff;
+}
+
+button.green {
+  background: linear-gradient(145deg,#008e72,#064b50);
+  border-color: #00d6a0;
+}
+
+button.gold {
+  background: linear-gradient(145deg,#b77c20,#604014);
+  border-color: #e6b44d;
+}
+
+button.red {
+  background: linear-gradient(145deg,#c8324b,#681b36);
+  border-color: #ff526b;
+}
+
+.card {
+  margin-top: 14px;
+  padding: 17px;
+  background: linear-gradient(145deg,#12223e,#0c1426);
+  border: 1px solid #24558b;
+  border-radius: 18px;
+  box-shadow: 0 0 18px #087dff18;
+}
+
+.card-title {
+  font-size: 15px;
+  font-weight: 800;
+  margin-bottom: 10px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.value {
+  font-size: 23px;
+  font-weight: 800;
+  color: var(--cyan);
+}
+
+.page { display: none; }
+.page.active { display: block; }
+
+.back {
+  width: 100%;
+  min-height: 48px;
+  margin-top: 18px;
+  background: #152b4a;
+}
+
+.signal {
+  border-left: 4px solid var(--blue);
+}
+
+.signal.success { border-left-color: var(--green); }
+
+.signal.loss { border-left-color: var(--red); }
+
+.footer {
+  text-align: center;
+  color: #607695;
+  font-size: 11px;
+  margin-top: 28px;
+}
 </style>
 </head>
 
 <body>
 
-<div class="logo">⚡ QUANTUM TRADE AI</div>
-<div class="subtitle">NEXT GENERATION TRADING PLATFORM</div>
+<header class="header">
+  <div class="logo">QUANTUM TRADE AI</div>
+  <div class="subtitle">NEXT GENERATION TRADING PLATFORM</div>
+  <div class="status">● СИСТЕМА ГОТОВА</div>
+</header>
 
-<div class="card">
-<h2>Добро пожаловать!</h2>
-<p class="info">Интеллектуальная платформа торговых сигналов.</p>
+<div id="home" class="page active">
+
+  <h2>ПАНЕЛЬ УПРАВЛЕНИЯ</h2>
+
+  <div class="menu">
+    <button onclick="openPage('binary')">⚡<br>БИНАРНЫЕ ОПЦИОНЫ</button>
+    <button class="purple" onclick="openPage('news')">🌐<br>НОВОСТИ</button>
+    <button class="green" onclick="openPage('stats')">📊<br>СТАТИСТИКА</button>
+    <button onclick="openPage('history')">🕘<br>ИСТОРИЯ СИГНАЛОВ</button>
+    <button class="gold" onclick="openPage('auto')">🤖<br>АВТОМАТИЧЕСКИЙ БОТ</button>
+    <button onclick="openPage('profile')">👤<br>МОЙ ПРОФИЛЬ</button>
+    <button class="purple" onclick="openPage('settings')">⚙️<br>НАСТРОЙКИ</button>
+  </div>
+
+  <div class="card">
+    <div class="card-title">QUANTUM MARKET</div>
+    <div class="muted">Торговая платформа и аналитика сигналов</div>
+    <canvas id="marketChart"></canvas>
+  </div>
 </div>
 
-<button onclick="openSection('БИНАРНЫЕ ОПЦИОНЫ')">⚡ БИНАРНЫЕ ОПЦИОНЫ</button>
-<button onclick="openSection('НОВОСТИ')">🌐 НОВОСТИ</button>
-<button onclick="openSection('СТАТИСТИКА')">📊 СТАТИСТИКА</button>
-<button onclick="openSection('ИСТОРИЯ СИГНАЛОВ')">🕘 ИСТОРИЯ СИГНАЛОВ</button>
-<button onclick="openSection('АВТОМАТИЧЕСКИЙ БОТ')">🤖 АВТОМАТИЧЕСКИЙ БОТ</button>
-<button onclick="openSection('МОЙ ПРОФИЛЬ')">👤 МОЙ ПРОФИЛЬ</button>
-<button onclick="openSection('НАСТРОЙКИ')">⚙️ НАСТРОЙКИ</button>
-
-<div class="card" id="content">
-<h2>QUANTUM SYSTEM</h2>
-<p class="info">Выбери интересующий раздел.</p>
+<div id="binary" class="page">
+  <h2>⚡ БИНАРНЫЕ ОПЦИОНЫ</h2>
+  <div class="card">
+    <div class="card-title">SIGNALS PRO</div>
+    <div class="muted">
+      Сигналы поступают из подключённого Telegram-канала.
+      Новые публикации и подтверждения будут отображаться здесь.
+    </div>
+  </div>
+  <div id="signals">
+    <div class="card signal">
+      <div class="card-title">ОЖИДАНИЕ СИГНАЛОВ</div>
+      <div class="muted">Пока новые сигналы не поступили.</div>
+    </div>
+  </div>
+  <button class="back" onclick="goHome()">← ГЛАВНОЕ МЕНЮ</button>
 </div>
+
+<div id="news" class="page">
+  <h2>🌐 НОВОСТИ</h2>
+  <div class="card">
+    <div class="card-title">РЫНОЧНЫЕ НОВОСТИ</div>
+    <div class="muted">Новостная лента появится после подключения источника данных.</div>
+  </div>
+  <button class="back" onclick="goHome()">← ГЛАВНОЕ МЕНЮ</button>
+</div>
+
+<div id="stats" class="page">
+  <h2>📊 СТАТИСТИКА</h2>
+  <div class="card">
+    <div class="card-title">РЕЗУЛЬТАТЫ ТОРГОВЛИ</div>
+    <div class="value" id="totalSignals">0</div>
+    <div class="muted">Получено сигналов</div>
+  </div>
+  <div class="card">
+    <div class="value" id="winRate">—</div>
+    <div class="muted">Процент успешных сделок — после загрузки результатов</div>
+  </div>
+  <button class="back" onclick="goHome()">← ГЛАВНОЕ МЕНЮ</button>
+</div>
+
+<div id="history" class="page">
+  <h2>🕘 ИСТОРИЯ СИГНАЛОВ</h2>
+  <div class="card muted">История будет заполняться сигналами из подключённого канала.</div>
+  <button class="back" onclick="goHome()">← ГЛАВНОЕ МЕНЮ</button>
+</div>
+
+<div id="auto" class="page">
+  <h2>🤖 АВТОМАТИЧЕСКИЙ БОТ</h2>
+  <div class="card">
+    <div class="card-title">QUANTUM TRADE AI — АВТОТРЕЙД</div>
+    <p class="muted">
+      Для подключения автоматического бота необходимо иметь аккаунт
+      у брокера Intrade Bar.
+    </p>
+    <p>🔹 Если у вас ещё нет аккаунта:</p>
+    <button class="green" onclick="openLink('https://go.intrade.bar/n4FmpAFBYfvE')">
+      РЕГИСТРАЦИЯ
+    </button>
+    <p>🔹 Если у вас уже есть аккаунт:</p>
+    <button class="purple" onclick="openLink('https://t.me/copy_broker_BO_bot')">
+      СВЯЗАТЬСЯ С ПОДДЕРЖКОЙ
+    </button>
+  </div>
+  <button class="back" onclick="goHome()">← ГЛАВНОЕ МЕНЮ</button>
+</div>
+
+<div id="profile" class="page">
+  <h2>👤 МОЙ ПРОФИЛЬ</h2>
+  <div class="card">
+    <div class="card-title">ПОЛЬЗОВАТЕЛЬ</div>
+    <div class="muted" id="userInfo">Telegram-профиль загружается...</div>
+  </div>
+  <button class="back" onclick="goHome()">← ГЛАВНОЕ МЕНЮ</button>
+</div>
+
+<div id="settings" class="page">
+  <h2>⚙️ НАСТРОЙКИ</h2>
+  <div class="card">
+    <div class="card-title">УВЕДОМЛЕНИЯ</div>
+    <div class="muted">Управление уведомлениями будет подключено к настройкам бота.</div>
+  </div>
+  <button class="back" onclick="goHome()">← ГЛАВНОЕ МЕНЮ</button>
+</div>
+
+<div class="footer">QUANTUM TRADE AI • PREMIUM TERMINAL</div>
 
 <script>
-const tg=window.Telegram?.WebApp;
+const tg = window.Telegram?.WebApp;
 tg?.ready();
 tg?.expand();
 
-function openSection(name){
-document.getElementById("content").innerHTML=
-`<h2>${name}</h2>
-<p class="info">Раздел QUANTUM TRADE AI. Подключение данных будет добавлено следующим этапом.</p>
-<button onclick="location.reload()">← ГЛАВНОЕ МЕНЮ</button>`;
+function openPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+function goHome() {
+  openPage('home');
+}
+
+function openLink(url) {
+  if (tg) tg.openLink(url);
+  else window.open(url, '_blank');
+}
+
+if (tg?.initDataUnsafe?.user) {
+  const user = tg.initDataUnsafe.user;
+  document.getElementById('userInfo').textContent =
+    (user.first_name || '') + ' ' + (user.last_name || '') +
+    (user.username ? ' (@' + user.username + ')' : '');
+} else {
+  document.getElementById('userInfo').textContent = 'Откройте приложение через Telegram.';
+}
+
+const canvas = document.getElementById('marketChart');
+
+if (canvas && window.Chart) {
+  new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: ['1','2','3','4','5','6','7'],
+      datasets: [{
+        label: 'Market',
+        data: [12,15,13,19,17,23,21],
+        borderColor: '#00d9ff',
+        backgroundColor: '#168cff22',
+        fill: true,
+        tension: 0.4
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: false },
+        y: {
+          grid: { color: '#203653' },
+          ticks: { color: '#91a4c2' }
+        }
+      }
+    }
+  });
 }
 </script>
 
