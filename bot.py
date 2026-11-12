@@ -1,8 +1,3 @@
-# =====================================================
-#          QUANTUM TRADE AI
-#       MAIN BOT + ADMIN BOT
-# =====================================================
-
 import asyncio
 import logging
 import os
@@ -10,544 +5,666 @@ import sqlite3
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
 )
+from aiogram.exceptions import TelegramAPIError
 
-# =====================================================
-# CONFIGURATION
-# =====================================================
+
+# ==================================================
+# НАСТРОЙКИ
+# ==================================================
 
 TOKEN_USER = os.getenv("TOKEN_USER", "").strip()
 TOKEN_ADMIN = os.getenv("TOKEN_ADMIN", "").strip()
 
 OWNER_ID = 770710937
-ADMIN_ID = 5232049751
+DEFAULT_ADMIN_ID = 5232049751
 
-BROKER_ID = "14659"
-BROKER_LINK = "https://go.intrade.bar/n4FmpAFBYfvE"
-SUPPORT_EMAIL = "support@intrade.bar"
-
-DB_PATH = "data/quantum.db"
+DB_PATH = "quantum.db"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# =====================================================
-# DATABASE
-# =====================================================
+log = logging.getLogger("QUANTUM_TRADE_AI")
 
-def database():
-    os.makedirs("data", exist_ok=True)
+
+# ==================================================
+# БАЗА ДАННЫХ
+# ==================================================
+
+def db():
     return sqlite3.connect(DB_PATH)
 
 
-def init_database():
-    with database() as db:
-        db.execute("""
+def init_db():
+    with db() as conn:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                first_name TEXT,
+                full_name TEXT,
                 status TEXT DEFAULT 'active',
-                joined TEXT
+                created_at TEXT
             )
         """)
 
-        db.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY
             )
         """)
 
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                name TEXT PRIMARY KEY,
-                value TEXT
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER,
+                action TEXT,
+                target_id INTEGER,
+                created_at TEXT
             )
         """)
 
-        db.execute(
-            "INSERT OR IGNORE INTO admins VALUES (?)",
-            (ADMIN_ID,)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                request TEXT,
+                status TEXT DEFAULT 'new',
+                created_at TEXT
+            )
+        """)
+
+        conn.execute(
+            "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
+            (DEFAULT_ADMIN_ID,)
         )
 
-        db.execute(
-            "INSERT OR IGNORE INTO settings VALUES (?, ?)",
-            ("owner_id", str(OWNER_ID))
-        )
 
-
-def owner_id():
-    with database() as db:
-        row = db.execute(
-            "SELECT value FROM settings WHERE name='owner_id'"
-        ).fetchone()
-        return int(row[0])
-
-
-def is_admin(user_id):
-    if user_id == owner_id():
-        return True
-
-    with database() as db:
-        row = db.execute(
-            "SELECT user_id FROM admins WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-
-    return row is not None
-
-
-def save_user(user):
-    with database() as db:
-        db.execute("""
+def register_user(user):
+    with db() as conn:
+        conn.execute("""
             INSERT OR IGNORE INTO users
-            (user_id, username, first_name, joined)
-            VALUES (?, ?, ?, ?)
+            (user_id, username, full_name, status, created_at)
+            VALUES (?, ?, ?, 'active', ?)
         """, (
             user.id,
             user.username or "",
-            user.first_name or "",
+            user.full_name or "",
             datetime.now(timezone.utc).isoformat()
         ))
 
+        conn.execute("""
+            UPDATE users
+            SET username = ?, full_name = ?
+            WHERE user_id = ?
+        """, (
+            user.username or "",
+            user.full_name or "",
+            user.id
+        ))
 
-def user_status(user_id):
-    with database() as db:
-        row = db.execute(
-            "SELECT status FROM users WHERE user_id=?",
+
+def get_status(user_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT status FROM users WHERE user_id = ?",
             (user_id,)
         ).fetchone()
 
     return row[0] if row else "active"
 
 
-def change_status(user_id, status):
-    with database() as db:
-        db.execute("""
-            UPDATE users SET status=?
-            WHERE user_id=?
-        """, (status, user_id))
+def set_status(user_id, status):
+    with db() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO users
+            (user_id, status, created_at)
+            VALUES (?, ?, ?)
+        """, (
+            user_id,
+            status,
+            datetime.now(timezone.utc).isoformat()
+        ))
+
+        conn.execute(
+            "UPDATE users SET status = ? WHERE user_id = ?",
+            (status, user_id)
+        )
 
 
-# =====================================================
-# KEYBOARDS
-# =====================================================
+def is_admin(user_id):
+    if user_id == OWNER_ID:
+        return True
 
-def main_keyboard():
+    with db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM admins WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
 
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="💱 Форекс"),
-                KeyboardButton(text="📈 Бинарные опционы")
-            ],
-            [
-                KeyboardButton(text="📰 Новости"),
-                KeyboardButton(text="📊 Статистика")
-            ],
-            [
-                KeyboardButton(text="🤖 Автоматический бот")
-            ],
-            [
-                KeyboardButton(text="⚙️ Настройки"),
-                KeyboardButton(text="👤 Мой профиль")
-            ]
+    return row is not None
+
+
+def add_audit(actor_id, action, target_id=None):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO audit
+            (actor_id, action, target_id, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            actor_id,
+            action,
+            target_id,
+            datetime.now(timezone.utc).isoformat()
+        ))
+
+
+# ==================================================
+# КЛАВИАТУРА ПОЛЬЗОВАТЕЛЯ
+# ==================================================
+
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="📊 FOREX"),
+            KeyboardButton(text="⚡ Бинарные опционы")
         ],
-        resize_keyboard=True
-    )
-
-
-def admin_keyboard():
-
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="📊 Статистика пользователей")
-            ],
-            [
-                KeyboardButton(text="🚫 Заблокировать"),
-                KeyboardButton(text="🔓 Разблокировать")
-            ],
-            [
-                KeyboardButton(text="⏸ Приостановить"),
-                KeyboardButton(text="▶️ Восстановить")
-            ],
-            [
-                KeyboardButton(text="👑 Управление администраторами")
-            ],
-            [
-                KeyboardButton(text="🔙 Выход")
-            ]
+        [
+            KeyboardButton(text="📰 Новости"),
+            KeyboardButton(text="📅 Экономический календарь")
         ],
-        resize_keyboard=True
-    )
+        [
+            KeyboardButton(text="📈 Статистика"),
+            KeyboardButton(text="🤖 Автоматический бот")
+        ],
+        [
+            KeyboardButton(text="👤 Мой профиль"),
+            KeyboardButton(text="⚙️ Настройки")
+        ]
+    ],
+    resize_keyboard=True
+)
 
 
-# =====================================================
-# MAIN BOT
-# =====================================================
+# ==================================================
+# ПРОВЕРКА ДОСТУПА
+# ==================================================
 
-user_bot = Bot(token=TOKEN_USER) if TOKEN_USER else None
+async def check_user(message: Message):
+    if not message.from_user:
+        return False
+
+    user_id = message.from_user.id
+
+    if get_status(user_id) in ("blocked", "suspended"):
+        await message.answer(
+            "⛔ Доступ к боту временно ограничен. "
+            "Обратитесь в поддержку."
+        )
+        return False
+
+    return True
+
+
+async def check_admin(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return False
+
+    return True
+
+
+async def check_owner(message: Message):
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        await message.answer("⛔ Эта команда доступна только владельцу.")
+        return False
+
+    return True
+
+
+# ==================================================
+# ПОЛЬЗОВАТЕЛЬСКИЙ БОТ
+# ==================================================
+
 user_dp = Dispatcher()
 
 
-@user_dp.message(CommandStart())
-async def start(message: Message):
+@user_dp.message(Command("start"))
+async def start_handler(message: Message):
+    register_user(message.from_user)
 
-    save_user(message.from_user)
-
-    status = user_status(message.from_user.id)
-
-    if status == "blocked":
-        await message.answer(
-            "🚫 Ваш аккаунт заблокирован."
-        )
+    if not await check_user(message):
         return
 
-    if status == "paused":
-        await message.answer(
-            "⏸ Ваш аккаунт временно приостановлен."
-        )
+    await message.answer(
+        "🤖 QUANTUM TRADE AI\n\n"
+        "Добро пожаловать в будущее интеллектуальной торговли!\n\n"
+        "Возможности платформы:\n\n"
+        "📊 FOREX — торговая аналитика\n"
+        "⚡ Бинарные опционы\n"
+        "📰 Новости рынка\n"
+        "📅 Экономический календарь\n"
+        "📈 Статистика\n"
+        "🤖 Автоматический бот\n"
+        "👤 Личный профиль\n"
+        "⚙️ Настройки\n\n"
+        "Выберите нужный раздел в меню.",
+        reply_markup=main_keyboard
+    )
+
+
+@user_dp.message(F.text)
+async def menu_handler(message: Message):
+    if not await check_user(message):
         return
 
-    text = (
-        "⚡ <b>QUANTUM TRADE AI</b>\n\n"
-        "👋 Добро пожаловать в будущее "
-        "интеллектуальной торговли!\n\n"
-        "🤖 Анализ рынка с помощью ИИ.\n"
-        "📊 Отслеживание рыночных движений.\n"
-        "⚡ Торговые сигналы и аналитика.\n"
-        "📈 Мониторинг финансовых активов.\n"
-        "🔐 Удобный личный кабинет.\n\n"
-        "<b>Умные технологии. "
-        "Новый взгляд на торговлю.</b>"
-    )
+    text = message.text
 
-    await message.answer(
-        text,
-        reply_markup=main_keyboard(),
-        parse_mode="HTML"
-    )
+    if text == "📊 FOREX":
+        await message.answer(
+            "📊 FOREX\n\n"
+            "Раздел аналитики валютного рынка.\n"
+            "Подключение реальных котировок и сигналов "
+            "требует настройки источника данных."
+        )
 
+    elif text == "⚡ Бинарные опционы":
+        await message.answer(
+            "⚡ БИНАРНЫЕ ОПЦИОНЫ\n\n"
+            "Раздел аналитики бинарных опционов.\n"
+            "Торговые сигналы появятся после подключения "
+            "проверенного источника данных."
+        )
 
-@user_dp.message(F.text == "💱 Форекс")
-async def forex(message: Message):
+    elif text == "📰 Новости":
+        await message.answer(
+            "📰 Новости рынка\n\n"
+            "Раздел новостей будет работать после "
+            "подключения новостного источника."
+        )
 
-    await message.answer(
-        "💱 <b>QUANTUM TRADE AI — FOREX</b>\n\n"
-        "Раздел валютного рынка.\n\n"
-        "📊 Здесь будут размещаться "
-        "аналитика и торговые сигналы.",
-        parse_mode="HTML"
-    )
+    elif text == "📅 Экономический календарь":
+        await message.answer(
+            "📅 Экономический календарь\n\n"
+            "Здесь будут отображаться важные экономические события."
+        )
 
+    elif text == "📈 Статистика":
+        await message.answer(
+            "📈 Статистика\n\n"
+            "Статистика появится после подключения "
+            "и сохранения реальных результатов."
+        )
 
-@user_dp.message(F.text == "📈 Бинарные опционы")
-async def binary(message: Message):
+    elif text == "🤖 Автоматический бот":
+        await message.answer(
+            "🤖 QUANTUM TRADE AI — АВТОТРЕЙД\n\n"
+            "Для подключения автоматического бота "
+            "необходимо быть зарегистрированным партнёром "
+            "брокера Intrade Bar.\n\n"
+            "🆔 Партнёрский ID: 14659\n\n"
+            "Если у вас уже есть аккаунт, напишите "
+            "в поддержку брокера и попросите перевести "
+            "ваш аккаунт под ID 14659.\n\n"
+            "Если аккаунта ещё нет, зарегистрируйтесь "
+            "по ссылке:\n"
+            "https://go.intrade.bar/n4FmpAFBYfvE\n\n"
+            "📩 Поддержка: support@intrade.bar\n\n"
+            "После перевода аккаунта можно обратиться "
+            "за подключением автотрейда."
+        )
 
-    await message.answer(
-        "📈 <b>БИНАРНЫЕ ОПЦИОНЫ</b>\n\n"
-        "⚡ Торговые сигналы.\n"
-        "📊 Анализ валютных пар.\n"
-        "₿ Анализ BTC/USDT.\n\n"
-        "Информация о сигналах будет "
-        "появляться в этом разделе.",
-        parse_mode="HTML"
-    )
+    elif text == "👤 Мой профиль":
+        user = message.from_user
 
+        await message.answer(
+            "👤 МОЙ ПРОФИЛЬ\n\n"
+            f"ID: {user.id}\n"
+            f"Имя: {user.full_name}\n"
+            f"Username: @{user.username or 'не указан'}\n"
+            f"Статус: {get_status(user.id)}"
+        )
 
-@user_dp.message(F.text == "📰 Новости")
-async def news(message: Message):
-
-    await message.answer(
-        "📰 <b>ФИНАНСОВЫЕ НОВОСТИ</b>\n\n"
-        "Здесь будут публиковаться:\n\n"
-        "💱 Новости Forex.\n"
-        "₿ Новости криптовалют.\n"
-        "📊 Фондовый рынок.\n"
-        "🛢 Сырьевые товары.\n"
-        "📅 Экономический календарь.\n\n"
-        "Источник новостей будет подключён отдельно.",
-        parse_mode="HTML"
-    )
-
-
-@user_dp.message(F.text == "📊 Статистика")
-async def statistics(message: Message):
-
-    with database() as db:
-        total = db.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
-
-        active = db.execute(
-            "SELECT COUNT(*) FROM users WHERE status='active'"
-        ).fetchone()[0]
-
-    await message.answer(
-        "📊 <b>СТАТИСТИКА QUANTUM TRADE AI</b>\n\n"
-        f"👥 Всего пользователей: {total}\n"
-        f"🟢 Активных пользователей: {active}\n\n"
-        "⚡ QUANTUM TRADE AI",
-        parse_mode="HTML"
-    )
+    elif text == "⚙️ Настройки":
+        await message.answer(
+            "⚙️ Настройки\n\n"
+            "Настройки профиля будут доступны здесь."
+        )
 
 
-@user_dp.message(F.text == "🤖 Автоматический бот")
-async def autotrade(message: Message):
+# ==================================================
+# АДМИНИСТРАТИВНЫЙ БОТ
+# ==================================================
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📋 Скопировать ID брокера: 14659",
-                    callback_data="broker_id"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📝 Регистрация у брокера",
-                    url=BROKER_LINK
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📩 Поддержка брокера",
-                    url="mailto:" + SUPPORT_EMAIL
-                )
-            ]
-        ]
-    )
-
-    await message.answer(
-        "🤖 <b>АВТОМАТИЧЕСКИЙ БОТ</b>\n\n"
-        "Для подключения автоматической торговли "
-        "необходимо быть нашим партнёром у брокера "
-        "<b>Intrade Bar</b>.\n\n"
-        "1️⃣ Напишите в поддержку брокера.\n\n"
-        "Попросите перевести ваш аккаунт "
-        "под партнёрский ID:\n\n"
-        "<code>14659</code>\n\n"
-        "2️⃣ Если у вас нет регистрации, "
-        "воспользуйтесь ссылкой ниже.\n\n"
-        "3️⃣ После перевода аккаунта обратитесь "
-        "к администратору для подключения.\n\n"
-        "⚠️ Автоматическая торговля связана "
-        "с риском потери средств.",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-
-
-@user_dp.callback_query(F.data == "broker_id")
-async def broker_id_callback(callback):
-
-    await callback.answer(
-        "Партнёрский ID: 14659",
-        show_alert=True
-    )
-
-
-@user_dp.message(F.text == "👤 Мой профиль")
-async def profile(message: Message):
-
-    user = message.from_user
-
-    status = user_status(user.id)
-
-    await message.answer(
-        "👤 <b>МОЙ ПРОФИЛЬ</b>\n\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Имя: {user.first_name}\n"
-        f"📛 Username: @{user.username or 'не указан'}\n"
-        f"🟢 Статус: {status}\n\n"
-        "⚡ QUANTUM TRADE AI",
-        parse_mode="HTML"
-    )
-
-
-@user_dp.message(F.text == "⚙️ Настройки")
-async def settings(message: Message):
-
-    await message.answer(
-        "⚙️ <b>НАСТРОЙКИ</b>\n\n"
-        "Управление уведомлениями и настройками "
-        "будет доступно здесь.",
-        parse_mode="HTML"
-    )
-
-
-# =====================================================
-# ADMIN BOT
-# =====================================================
-
-admin_bot = Bot(token=TOKEN_ADMIN) if TOKEN_ADMIN else None
 admin_dp = Dispatcher()
 
 
-@admin_dp.message(CommandStart())
+@admin_dp.message(Command("start"))
 async def admin_start(message: Message):
-
-    if not is_admin(message.from_user.id):
-        await message.answer(
-            "⛔ Доступ запрещён."
-        )
+    if not await check_admin(message):
         return
 
     await message.answer(
-        "👑 <b>QUANTUM TRADE AI</b>\n"
-        "АДМИНИСТРАТИВНАЯ ПАНЕЛЬ\n\n"
-        "Добро пожаловать!",
-        reply_markup=admin_keyboard(),
-        parse_mode="HTML"
+        "🛡 QUANTUM TRADE AI — ПАНЕЛЬ УПРАВЛЕНИЯ\n\n"
+        "Доступные команды:\n\n"
+        "/stats — статистика\n"
+        "/users — список пользователей\n"
+        "/user ID — информация о пользователе\n"
+        "/ban ID — заблокировать\n"
+        "/unban ID — разблокировать\n"
+        "/suspend ID — приостановить\n"
+        "/restore ID — восстановить\n"
+        "/requests — заявки\n"
+        "/audit — журнал действий\n"
+        "/broadcast ТЕКСТ — рассылка\n"
+        "/help — помощь"
     )
 
 
-@admin_dp.message(Command("id"))
-async def get_id(message: Message):
+@admin_dp.message(Command("help"))
+async def help_handler(message: Message):
+    if not await check_admin(message):
+        return
 
-    await message.answer(
-        f"🆔 Ваш Telegram ID: {message.from_user.id}"
-    )
+    await admin_start(message)
 
 
 @admin_dp.message(Command("stats"))
-async def admin_stats(message: Message):
-
-    if not is_admin(message.from_user.id):
+async def stats_handler(message: Message):
+    if not await check_admin(message):
         return
 
-    with database() as db:
-        total = db.execute(
+    with db() as conn:
+        total = conn.execute(
             "SELECT COUNT(*) FROM users"
         ).fetchone()[0]
 
-        active = db.execute(
+        active = conn.execute(
             "SELECT COUNT(*) FROM users WHERE status='active'"
         ).fetchone()[0]
 
-        blocked = db.execute(
+        blocked = conn.execute(
             "SELECT COUNT(*) FROM users WHERE status='blocked'"
         ).fetchone()[0]
 
-        paused = db.execute(
-            "SELECT COUNT(*) FROM users WHERE status='paused'"
+        suspended = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE status='suspended'"
         ).fetchone()[0]
 
     await message.answer(
-        "📊 <b>СТАТИСТИКА</b>\n\n"
-        f"👥 Всего: {total}\n"
-        f"🟢 Активных: {active}\n"
-        f"🚫 Заблокированных: {blocked}\n"
-        f"⏸ Приостановленных: {paused}",
-        parse_mode="HTML"
+        "📊 СТАТИСТИКА\n\n"
+        f"Всего пользователей: {total}\n"
+        f"Активных: {active}\n"
+        f"Заблокированных: {blocked}\n"
+        f"Приостановленных: {suspended}"
     )
 
 
-async def set_user_status(message, status):
+@admin_dp.message(Command("users"))
+async def users_handler(message: Message):
+    if not await check_admin(message):
+        return
 
-    if not is_admin(message.from_user.id):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT user_id, username, status
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT 30
+        """).fetchall()
+
+    if not rows:
+        await message.answer("Пользователей пока нет.")
+        return
+
+    result = "👥 ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ\n\n"
+
+    for user_id, username, status in rows:
+        result += (
+            f"ID: {user_id}\n"
+            f"Username: @{username or 'нет'}\n"
+            f"Статус: {status}\n\n"
+        )
+
+    await message.answer(result)
+
+
+@admin_dp.message(Command("user"))
+async def user_info_handler(message: Message):
+    if not await check_admin(message):
         return
 
     parts = (message.text or "").split()
 
     if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer(
-            "Использование: команда ID_пользователя"
-        )
+        await message.answer("Использование: /user ID")
         return
 
-    target_id = int(parts[1])
+    user_id = int(parts[1])
 
-    if target_id == owner_id():
-        await message.answer(
-            "⛔ Нельзя менять статус владельца."
-        )
+    with db() as conn:
+        row = conn.execute("""
+            SELECT user_id, username, full_name, status, created_at
+            FROM users WHERE user_id = ?
+        """, (user_id,)).fetchone()
+
+    if not row:
+        await message.answer("Пользователь не найден.")
         return
-
-    with database() as db:
-        exists = db.execute(
-            "SELECT user_id FROM users WHERE user_id=?",
-            (target_id,)
-        ).fetchone()
-
-    if not exists:
-        await message.answer(
-            "❌ Пользователь не найден в базе."
-        )
-        return
-
-    change_status(target_id, status)
 
     await message.answer(
-        f"✅ Статус пользователя {target_id}: {status}"
+        "👤 ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ\n\n"
+        f"ID: {row[0]}\n"
+        f"Username: @{row[1] or 'нет'}\n"
+        f"Имя: {row[2] or 'нет'}\n"
+        f"Статус: {row[3]}\n"
+        f"Регистрация: {row[4] or 'неизвестно'}"
     )
 
 
-@admin_dp.message(Command("block"))
-async def block_user(message: Message):
-    await set_user_status(message, "blocked")
-
-
-@admin_dp.message(Command("unblock"))
-async def unblock_user(message: Message):
-    await set_user_status(message, "active")
-
-
-@admin_dp.message(Command("pause"))
-async def pause_user(message: Message):
-    await set_user_status(message, "paused")
-
-
-@admin_dp.message(Command("resume"))
-async def resume_user(message: Message):
-    await set_user_status(message, "active")
-
-
-# =====================================================
-# OWNER COMMANDS
-# =====================================================
-
-@admin_dp.message(Command("makeadmin"))
-async def make_admin(message: Message):
-
-    if message.from_user.id != owner_id():
-        await message.answer("⛔ Только владелец может выдавать админку.")
+async def change_user_status(message: Message, status: str):
+    if not await check_admin(message):
         return
 
     parts = (message.text or "").split()
 
     if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Использование: /makeadmin ID")
+        await message.answer("Укажите ID пользователя.")
         return
 
-    target = int(parts[1])
+    user_id = int(parts[1])
 
-    with database() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO admins VALUES (?)",
-            (target,)
-        )
+    if user_id == OWNER_ID:
+        await message.answer("Нельзя изменять статус владельца.")
+        return
+
+    set_status(user_id, status)
+    add_audit(message.from_user.id, status, user_id)
 
     await message.answer(
-        f"👑 Пользователь {target} получил права администратора."
+        f"✅ Статус пользователя {user_id}: {status}"
+    )
+
+
+@admin_dp.message(Command("ban"))
+async def ban_handler(message: Message):
+    await change_user_status(message, "blocked")
+
+
+@admin_dp.message(Command("unban"))
+async def unban_handler(message: Message):
+    await change_user_status(message, "active")
+
+
+@admin_dp.message(Command("suspend"))
+async def suspend_handler(message: Message):
+    await change_user_status(message, "suspended")
+
+
+@admin_dp.message(Command("restore"))
+async def restore_handler(message: Message):
+    await change_user_status(message, "active")
+
+
+@admin_dp.message(Command("requests"))
+async def requests_handler(message: Message):
+    if not await check_admin(message):
+        return
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT id, user_id, request, status
+            FROM requests
+            ORDER BY id DESC
+            LIMIT 20
+        """).fetchall()
+
+    if not rows:
+        await message.answer("Новых заявок пока нет.")
+        return
+
+    result = "📨 ЗАЯВКИ\n\n"
+
+    for row in rows:
+        result += (
+            f"Заявка №{row[0]}\n"
+            f"Пользователь: {row[1]}\n"
+            f"Текст: {row[2]}\n"
+            f"Статус: {row[3]}\n\n"
+        )
+
+    await message.answer(result)
+
+
+@admin_dp.message(Command("audit"))
+async def audit_handler(message: Message):
+    if not await check_admin(message):
+        return
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT actor_id, action, target_id, created_at
+            FROM audit
+            ORDER BY id DESC
+            LIMIT 20
+        """).fetchall()
+
+    if not rows:
+        await message.answer("Журнал пока пуст.")
+        return
+
+    result = "📋 ЖУРНАЛ ДЕЙСТВИЙ\n\n"
+
+    for row in rows:
+        result += (
+            f"Администратор: {row[0]}\n"
+            f"Действие: {row[1]}\n"
+            f"Пользователь: {row[2]}\n"
+            f"Дата: {row[3]}\n\n"
+        )
+
+    await message.answer(result)
+
+
+@admin_dp.message(Command("broadcast"))
+async def broadcast_handler(message: Message, bot: Bot):
+    if not await check_admin(message):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) < 2:
+        await message.answer(
+            "Использование:\n/broadcast Текст сообщения"
+        )
+        return
+
+    text = parts[1]
+
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM users WHERE status='active'"
+        ).fetchall()
+
+    sent = 0
+    failed = 0
+
+    for row in rows:
+        try:
+            await bot.send_message(row[0], text)
+            sent += 1
+        except TelegramAPIError:
+            failed += 1
+
+        await asyncio.sleep(0.05)
+
+    add_audit(message.from_user.id, "broadcast")
+
+    await message.answer(
+        "📢 РАССЫЛКА ЗАВЕРШЕНА\n\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
+
+
+# ==================================================
+# УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ
+# ==================================================
+
+@admin_dp.message(Command("adminlist"))
+async def admin_list_handler(message: Message):
+    if not await check_owner(message):
+        return
+
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM admins"
+        ).fetchall()
+
+    result = "🛡 СПИСОК АДМИНИСТРАТОРОВ\n\n"
+    result += f"Владелец: {OWNER_ID}\n"
+
+    for row in rows:
+        result += f"Администратор: {row[0]}\n"
+
+    await message.answer(result)
+
+
+@admin_dp.message(Command("addadmin"))
+async def add_admin_handler(message: Message):
+    if not await check_owner(message):
+        return
+
+    parts = (message.text or "").split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /addadmin ID")
+        return
+
+    user_id = int(parts[1])
+
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
+            (user_id,)
+        )
+
+    add_audit(message.from_user.id, "add_admin", user_id)
+
+    await message.answer(
+        f"✅ Пользователь {user_id} назначен администратором."
     )
 
 
 @admin_dp.message(Command("removeadmin"))
-async def remove_admin(message: Message):
-
-    if message.from_user.id != owner_id():
-        await message.answer("⛔ Только владелец может снимать админку.")
+async def remove_admin_handler(message: Message):
+    if not await check_owner(message):
         return
 
     parts = (message.text or "").split()
@@ -556,158 +673,51 @@ async def remove_admin(message: Message):
         await message.answer("Использование: /removeadmin ID")
         return
 
-    target = int(parts[1])
+    user_id = int(parts[1])
 
-    if target == owner_id():
-        await message.answer("Нельзя снять права владельца.")
+    if user_id == OWNER_ID:
+        await message.answer("Нельзя удалить владельца.")
         return
 
-    with database() as db:
-        db.execute(
-            "DELETE FROM admins WHERE user_id=?",
-            (target,)
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM admins WHERE user_id = ?",
+            (user_id,)
         )
 
+    add_audit(message.from_user.id, "remove_admin", user_id)
+
     await message.answer(
-        f"✅ Права администратора сняты с {target}."
+        f"✅ Права администратора у {user_id} сняты."
     )
 
 
-@admin_dp.message(Command("transferowner"))
-async def transfer_owner(message: Message):
-
-    if message.from_user.id != owner_id():
-        await message.answer("⛔ Только текущий владелец может передать права.")
-        return
-
-    parts = (message.text or "").split()
-
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Использование: /transferowner ID")
-        return
-
-    target = int(parts[1])
-
-    if target == owner_id():
-        await message.answer("Этот пользователь уже владелец.")
-        return
-
-    with database() as db:
-        db.execute(
-            "UPDATE settings SET value=? WHERE name='owner_id'",
-            (str(target),)
-        )
-
-    await message.answer(
-        f"👑 Полные права владельца переданы пользователю {target}."
-    )
-
-
-# =====================================================
-# ADMIN MENU
-# =====================================================
-
-@admin_dp.message(F.text == "📊 Статистика пользователей")
-async def admin_menu_stats(message: Message):
-
-    await admin_stats(message)
-
-
-@admin_dp.message(F.text == "🚫 Заблокировать")
-async def admin_menu_block(message: Message):
-
-    await message.answer(
-        "Для блокировки отправьте:\n/block ID"
-    )
-
-
-@admin_dp.message(F.text == "🔓 Разблокировать")
-async def admin_menu_unblock(message: Message):
-
-    await message.answer(
-        "Для разблокировки отправьте:\n/unblock ID"
-    )
-
-
-@admin_dp.message(F.text == "⏸ Приостановить")
-async def admin_menu_pause(message: Message):
-
-    await message.answer(
-        "Для приостановки отправьте:\n/pause ID"
-    )
-
-
-@admin_dp.message(F.text == "▶️ Восстановить")
-async def admin_menu_resume(message: Message):
-
-    await message.answer(
-        "Для восстановления отправьте:\n/resume ID"
-    )
-
-
-@admin_dp.message(F.text == "👑 Управление администраторами")
-async def admin_management(message: Message):
-
-    if message.from_user.id != owner_id():
-        await message.answer("⛔ Только владелец.")
-        return
-
-    await message.answer(
-        "👑 <b>УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ</b>\n\n"
-        "Выдать права:\n"
-        "/makeadmin ID\n\n"
-        "Снять права:\n"
-        "/removeadmin ID\n\n"
-        "Передать владение:\n"
-        "/transferowner ID",
-        parse_mode="HTML"
-    )
-
-
-@admin_dp.message(F.text == "🔙 Выход")
-async def admin_exit(message: Message):
-
-    await message.answer(
-        "Вы вышли из административной панели."
-    )
-
-
-# =====================================================
-# SECURITY MIDDLEWARE
-# =====================================================
-
-@user_dp.message()
-async def check_user_status(message: Message):
-
-    if message.from_user:
-        status = user_status(message.from_user.id)
-
-        if status == "blocked":
-            await message.answer("🚫 Ваш аккаунт заблокирован.")
-        elif status == "paused":
-            await message.answer("⏸ Ваш аккаунт временно приостановлен.")
-
-
-# =====================================================
-# START
-# =====================================================
+# ==================================================
+# ЗАПУСК
+# ==================================================
 
 async def main():
+    init_db()
 
     if not TOKEN_USER:
-        raise RuntimeError("GitHub Secret TOKEN_USER is missing.")
+        raise RuntimeError("Не задан GitHub Secret TOKEN_USER")
 
     if not TOKEN_ADMIN:
-        raise RuntimeError("GitHub Secret TOKEN_ADMIN is missing.")
+        raise RuntimeError("Не задан GitHub Secret TOKEN_ADMIN")
 
-    init_database()
+    user_bot = Bot(token=TOKEN_USER)
+    admin_bot = Bot(token=TOKEN_ADMIN)
 
-    log.info("Starting QUANTUM TRADE AI...")
+    log.info("QUANTUM TRADE AI запускается...")
 
-    await asyncio.gather(
-        user_dp.start_polling(user_bot),
-        admin_dp.start_polling(admin_bot)
-    )
+    try:
+        await asyncio.gather(
+            user_dp.start_polling(user_bot),
+            admin_dp.start_polling(admin_bot)
+        )
+    finally:
+        await user_bot.session.close()
+        await admin_bot.session.close()
 
 
 if __name__ == "__main__":
