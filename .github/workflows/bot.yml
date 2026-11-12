@@ -14,7 +14,7 @@ on:
 
 concurrency:
   group: quantum-trade-ai-bot
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-bot:
