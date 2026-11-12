@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <meta name="theme-color" content="#050b18">
+
+    <title>QUANTUM TRADE AI</title>
+
+    <link rel="stylesheet" href="style.css">
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+
+<div class="background-grid"></div>
+<div class="glow glow-one"></div>
+<div class="glow glow-two"></div>
+
+<div class="app">
+
+    <header class="topbar">
+        <div class="logo">
+            <div class="logo-icon">Q</div>
+            <div>
+                <h1>QUANTUM <span>TRADE AI</span></h1>
+                <small>INTELLIGENT TRADING SYSTEM</small>
+            </div>
+        </div>
+
+        <div class="status">
+            <span class="status-dot"></span>
+            ONLINE
+        </div>
+    </header>
+
+    <section class="hero">
+        <div class="hero-label">ARTIFICIAL INTELLIGENCE</div>
+
+        <h2>
+            ТОРГОВЫЙ<br>
+            <span>ТЕРМИНАЛ</span>
+        </h2>
+
+        <p>
+            Аналитика рынка, торговые сигналы
+            и технологии нового поколения.
+        </p>
+
+        <div class="hero-bottom">
+            <span>QUANTUM SYSTEM v1.0</span>
+            <span class="live">● LIVE SYSTEM</span>
+        </div>
+    </section>
+
+    <section class="market-card">
+        <div class="section-heading">
+            <h3>📊 РЫНОК</h3>
+            <span class="live">LIVE</span>
+        </div>
+
+        <div class="market-info">
+            <div>
+                <small>BTC / USDT</small>
+                <h2 id="btcPrice">Загрузка...</h2>
+            </div>
+
+            <div class="market-change" id="btcChange">
+                --
+            </div>
+        </div>
+
+        <div class="chart-box">
+            <canvas id="marketChart"></canvas>
+        </div>
+
+        <small class="chart-caption">
+            Демонстрационный график. Для реальных котировок
+            требуется подключить поставщика данных.
+        </small>
+    </section>
+
+    <section class="menu-section">
+
+        <div class="section-heading">
+            <h3>ГЛАВНОЕ МЕНЮ</h3>
+            <span class="menu-count">07 MODULES</span>
+        </div>
+
+        <div class="menu-grid">
+
+            <button class="menu-button blue" data-page="binary">
+                <span class="button-icon">⚡</span>
+                <span>
+                    <b>БИНАРНЫЕ ОПЦИОНЫ</b>
+                    <small>Торговые сигналы</small>
+                </span>
+                <span class="arrow">›</span>
+            </button>
+
+            <button class="menu-button purple" data-page="news">
+                <span class="button-icon">🌐</span>
+                <span>
+                    <b>НОВОСТИ</b>
+                    <small>Новости финансовых рынков</small>
+                </span>
+                <span class="arrow">›</span>
+            </button>
+
+            <button class="menu-button cyan" data-page="statistics">
+                <span class="button-icon">📊</span>
+                <span>
+                    <b>СТАТИСТИКА</b>
+                    <small>Результаты сигналов</small>
+                </span>
+                <span class="arrow">›</span>
+            </button>
+
+            <button class="menu-button gold" data-page="history">
+                <span class="button-icon">🕘</span>
+                <span>
+                    <b>ИСТОРИЯ СИГНАЛОВ</b>
+                    <small>Архив сделок</small>
+                </span>
+                <span class="arrow">›</span>
+            </button>
+
+            <button class="menu-button green" data-page="autobot">
+                <span class="button-icon">🤖</span>
+                <span>
+                    <b>АВТОМАТИЧЕСКИЙ БОТ</b>
+                    <small>Подключение автоторговли</small>
+                </span>
+                <span class="arrow">›</span>
+            </button>
+
+            <button class="menu-button pink" data-page="profile">
+                <span class="button-icon">👤</span>
+                <span>
+                    <b>МОЙ ПРОФИЛЬ</b>
+                    <small>Информация об аккаунте</small>
+                </span>
+                <span class="arrow">›</span>
+            </button>
+
+            <button class="menu-button gray" data-page="settings">
+                <span class="button-icon">⚙️</span>
+                <span>
+                    <b>НАСТРОЙКИ</b>
+                    <small>Управление приложением</small>
+                </span>
+                <span class="arrow">›</span>
+            </button>
+
+        </div>
+    </section>
+
+    <section class="content-card" id="contentCard">
+        <div class="content-title">QUANTUM TRADE AI</div>
+        <p>Выберите необходимый раздел терминала.</p>
+    </section>
+
+    <footer>
+        <div class="footer-logo">QUANTUM TRADE AI</div>
+        <small>POWERED BY ARTIFICIAL INTELLIGENCE</small>
+        <small class="copyright">© 2026 ALL RIGHTS RESERVED</small>
+    </footer>
+
+</div>
+
+<script src="app.js"></script>
+
+</body>
+</html>
