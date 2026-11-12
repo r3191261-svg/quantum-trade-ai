@@ -1,581 +1,1497 @@
-# QUANTUM TRADE AI — user bot + admin bot (один файл, одна база)
-import asyncio, html, logging, os, secrets, sqlite3, time
+import asyncio
+import logging
+import os
+import sqlite3
+
 from datetime import datetime, timezone
 
-import aiohttp
-import feedparser
-from aiogram import BaseMiddleware, Bot, Dispatcher, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton as IB, InlineKeyboardMarkup as IM, Message
-
-logging.basicConfig(level=logging.INFO)
-TOKEN_USER = os.environ["TOKEN_USER"]
-TOKEN_ADMIN = os.environ["TOKEN_ADMIN"]
-OWNER_ID = 770710937
-ADMIN_ID = 5232049751
-AUTOTRADE_ID = "14659"
-BROKER_LINK = "https://go.intrade.bar/n4FmpAFBYfvE"
-SUPPORT_URL = os.environ.get("SUPPORT_URL", f"tg://user?id={ADMIN_ID}")
-WELCOME_PHOTO = os.environ.get("WELCOME_PHOTO", "")  # file_id или URL картинки (необязательно)
-
-# ───────────────────────── БАЗА ─────────────────────────
-os.makedirs("data", exist_ok=True)
-db = sqlite3.connect("data/bot.db", check_same_thread=False)
-db.row_factory = sqlite3.Row
-db.executescript("""
-create table if not exists users(id integer primary key, name text, username text,
- status text default 'active', role text default 'user', until integer default 0,
- news integer default 1, joined integer);
-create table if not exists audit(id integer primary key autoincrement, ts integer, actor integer, target integer, action text, details text);
-create table if not exists requests(id integer primary key autoincrement, uid integer, status text default 'pending', ts integer);
-create table if not exists signals(id integer primary key autoincrement, ts integer, pair text, dir text, exp text, result text default '');
-create table if not exists seen(link text primary key);
-create table if not exists transfers(id integer primary key autoincrement, old integer, new integer, status text, ts integer);
-""")
-
-def now(): return int(time.time())
-def q(sql, *a):
-    c = db.execute(sql, a); db.commit(); return c
-def one(sql, *a): return db.execute(sql, a).fetchone()
-def rows(sql, *a): return db.execute(sql, a).fetchall()
-def tfmt(ts): return datetime.fromtimestamp(ts, timezone.utc).strftime("%d.%m %H:%M")
-
-q("insert or ignore into users(id,name,role,joined) values(?,?,?,?)", OWNER_ID, "-", "owner", now())
-q("insert or ignore into users(id,name,role,joined) values(?,?,?,?)", ADMIN_ID, "-", "admin", now())
-
-def register(u):
-    q("insert or ignore into users(id,joined) values(?,?)", u.id, now())
-    q("update users set name=?, username=? where id=?", u.full_name, u.username or "", u.id)
-
-def get(uid):
-    r = one("select * from users where id=?", uid)
-    if r and r["status"] == "suspended" and r["until"] and r["until"] < now():
-        q("update users set status='active', until=0 where id=?", uid)
-        r = one("select * from users where id=?", uid)
-    return r
-
-def arole(uid):
-    r = get(uid)
-    return r["role"] if r and r["status"] == "active" else "user"
-
-def log(actor, target, action, det=""):
-    q("insert into audit(ts,actor,target,action,details) values(?,?,?,?,?)", now(), actor, target, action, det)
-
-def fu(r):
-    un = f"@{r['username']}" if r["username"] else ""
-    return f"<code>{r['id']}</code> {html.escape(r['name'] or '-')} {un} [{r['status']}/{r['role']}]"
-
-def btn(text, data=None, url=None, style=None):
-    kw = {"text": text}
-    if data: kw["callback_data"] = data
-    if url: kw["url"] = url
-    if style: kw["style"] = style  # цвет кнопки: success / primary / danger
-    return IB(**kw)
-
-def kb(r): return IM(inline_keyboard=r)
-
-ub: Bot = None
-ab: Bot = None
-ur, ar = Router(), Router()
-
-# ───────────────────────── КУРСЫ ─────────────────────────
-CUR = ["EUR", "GBP", "AUD", "NZD", "USD", "CAD", "CHF", "JPY", "RUB", "TRY", "CNY"]
-PAIRS = [(a, b) for i, a in enumerate(CUR) for b in CUR[i + 1:]]
-MAJORS = [("EUR","USD"),("GBP","USD"),("USD","JPY"),("USD","CHF"),("AUD","USD"),("USD","CAD"),
-          ("NZD","USD"),("EUR","JPY"),("GBP","JPY"),("EUR","GBP")]
-ORDER = MAJORS + [p for p in PAIRS if p not in MAJORS]
-_rc = {"t": 0, "d": {}}
-
-async def rates():
-    if _rc["d"] and time.time() - _rc["t"] < 60: return _rc["d"]
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-            async with s.get("https://open.er-api.com/v6/latest/USD") as r:
-                j = await r.json()
-        _rc.update(t=time.time(), d=j["rates"])
-    except Exception as e:
-        logging.warning("rates: %s", e)
-    return _rc["d"]
-
-def fp(x): return f"{x:.3f}" if x >= 20 else f"{x:.5f}"
-def tv(a, b): return f"https://www.tradingview.com/chart/?symbol=FX:{a}{b}"
-
-# ───────────────────────── НОВОСТИ ─────────────────────────
-FEEDS = [
-    "https://ru.investing.com/rss/news.rss",
-    "https://ru.investing.com/rss/news_1.rss",
-    "https://ru.investing.com/rss/news_301.rss",
-    "https://news.google.com/rss/search?q=форекс+OR+валюты+OR+нефть&hl=ru&gl=RU&ceid=RU:ru",
-]
-
-async def fetch_news():
-    items, seen = [], set()
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=20)) as s:
-        for u in FEEDS:
-            try:
-                async with s.get(u) as r: t = await r.text()
-                f = await asyncio.to_thread(feedparser.parse, t)
-                for e in f.entries[:12]:
-                    if e.link not in seen:
-                        seen.add(e.link)
-                        items.append((e.get("published_parsed") or time.gmtime(0), e.title, e.link))
-            except Exception as ex:
-                logging.warning("feed %s: %s", u, ex)
-    items.sort(key=lambda x: x[0], reverse=True)
-    return items
-
-async def bcast(text, only_news=False):
-    n = 0
-    sql = "select id from users where status='active'" + (" and news=1" if only_news else "")
-    for r in rows(sql):
-        try:
-            await ub.send_message(r["id"], text); n += 1
-        except Exception: pass
-        await asyncio.sleep(0.05)
-    return n
-
-async def news_loop():
-    first = not one("select 1 from seen limit 1")
-    while True:
-        try:
-            items = await fetch_news()
-            new = [i for i in items if not one("select 1 from seen where link=?", i[2])]
-            for i in new: q("insert or ignore into seen values(?)", i[2])
-            if not first:
-                for _, title, link in new[:3]:
-                    await bcast(f"🔴 <b>Новое:</b> {html.escape(title)}\n{link}", only_news=True)
-            first = False
-        except Exception as e:
-            logging.warning("news_loop: %s", e)
-        await asyncio.sleep(300)
-
-# ───────────────────────── USER BOT ─────────────────────────
-WELCOME = (
-    "⚡ <b>QUANTUM TRADE AI</b>\n\n<b>Добро пожаловать в мир интеллектуальной торговли!</b>\n\n"
-    "QUANTUM TRADE AI — современная аналитическая платформа, объединяющая искусственный интеллект, "
-    "финансовые рынки и передовые технологии.\n\n🤖 <b>ЧТО ДОСТУПНО НА ПЛАТФОРМЕ:</b>\n\n"
-    "📊 FOREX — анализ валютных рынков\n⚡ BINARY OPTIONS — торговые сигналы\n"
-    "📰 NEWS — свежие финансовые новости 24/7\n📅 ECONOMIC CALENDAR — календарь событий\n"
-    "📈 STATISTICS — статистика сигналов\n🤖 AUTO TRADE — автоматизированная торговля\n"
-    "🔐 PERSONAL ACCOUNT — личный кабинет\n\n━━━━━━━━━━━━━━━━━━\n"
-    "Выбери раздел в меню.\n\n<i>Интеллект. Технологии. Новые возможности.</i>"
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
-RISK = "⚠️ <i>Торговля рискованна, сигналы не гарантируют прибыль. Торгуйте только теми средствами, потерю которых можете себе позволить.</i>"
+from aiogram.exceptions import TelegramAPIError
 
-def menu():
-    return [
-        [btn("📊 Форекс", "m:fx:0", style="success"), btn("⚡ Бинарные опционы", "m:bin", style="primary")],
-        [btn("📰 Новости", "m:news"), btn("📈 Статистика", "m:stat")],
-        [btn("🤖 Автоматический бот (Автотрейд)", "m:auto", style="primary")],
-        [btn("📅 Календарь", "m:cal"), btn("📉 Графики", "m:chart")],
-        [btn("⚙️ Настройки", "m:set"), btn("👤 Мой профиль", "m:prof")],
+
+# ==========================================
+# QUANTUM TRADE AI
+# ==========================================
+
+TOKEN_USER = os.getenv("TOKEN_USER", "").strip()
+TOKEN_ADMIN = os.getenv("TOKEN_ADMIN", "").strip()
+
+OWNER_ID = 770710937
+DEFAULT_ADMIN_ID = 5232049751
+
+# ID канала SIGNALS PRO
+SOURCE_CHANNEL_ID = -1003979525371
+
+DB_PATH = "quantum.db"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+log = logging.getLogger("QUANTUM_TRADE_AI")
+
+user_dp = Dispatcher()
+admin_dp = Dispatcher()
+
+
+# ==========================================
+# БАЗА ДАННЫХ
+# ==========================================
+
+def connect_db():
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def init_db():
+    with connect_db() as conn:
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT DEFAULT '',
+                full_name TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',
+                notifications INTEGER DEFAULT 1,
+                language TEXT DEFAULT 'ru',
+                created_at TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instrument TEXT,
+                direction TEXT,
+                timeframe TEXT,
+                details TEXT,
+                created_at TEXT,
+                created_by INTEGER
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER,
+                action TEXT,
+                target_id INTEGER,
+                created_at TEXT
+            )
+        """)
+
+        conn.execute(
+            "INSERT OR IGNORE INTO admins VALUES (?)",
+            (DEFAULT_ADMIN_ID,)
+        )
+
+
+def register_user(user):
+
+    with connect_db() as conn:
+
+        conn.execute("""
+            INSERT OR IGNORE INTO users
+            (user_id, username, full_name, status,
+             notifications, language, created_at)
+            VALUES (?, ?, ?, 'active', 1, 'ru', ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.full_name or "",
+            now()
+        ))
+
+        conn.execute("""
+            UPDATE users
+            SET username=?, full_name=?
+            WHERE user_id=?
+        """, (
+            user.username or "",
+            user.full_name or "",
+            user.id
+        ))
+
+
+def get_user(user_id):
+
+    with connect_db() as conn:
+
+        return conn.execute(
+            "SELECT * FROM users WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+
+
+def get_status(user_id):
+
+    user = get_user(user_id)
+
+    return user[3] if user else "active"
+
+
+def set_status(user_id, status):
+
+    with connect_db() as conn:
+
+        conn.execute("""
+            INSERT OR IGNORE INTO users
+            (user_id, status, created_at)
+            VALUES (?, ?, ?)
+        """, (user_id, status, now()))
+
+        conn.execute(
+            "UPDATE users SET status=? WHERE user_id=?",
+            (status, user_id)
+        )
+
+
+def is_admin(user_id):
+
+    if user_id == OWNER_ID:
+        return True
+
+    with connect_db() as conn:
+
+        result = conn.execute(
+            "SELECT 1 FROM admins WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+
+    return result is not None
+
+
+def audit(actor, action, target=None):
+
+    with connect_db() as conn:
+
+        conn.execute("""
+            INSERT INTO audit
+            (actor_id, action, target_id, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (actor, action, target, now()))
+
+
+# ==========================================
+# КЛАВИАТУРА
+# ==========================================
+
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="📊 FOREX"),
+            KeyboardButton(text="⚡ Бинарные опционы")
+        ],
+        [
+            KeyboardButton(text="📰 Новости"),
+            KeyboardButton(text="📅 Экономический календарь")
+        ],
+        [
+            KeyboardButton(text="📈 Статистика"),
+            KeyboardButton(text="🕘 История сигналов")
+        ],
+        [
+            KeyboardButton(text="🤖 Автоматический бот"),
+            KeyboardButton(text="👤 Мой профиль")
+        ],
+        [
+            KeyboardButton(text="⚙️ Настройки")
+        ]
+    ],
+    resize_keyboard=True
+)
+
+
+def settings_keyboard(enabled):
+
+    notification_text = (
+        "🔔 Уведомления: ВКЛ"
+        if enabled else
+        "🔕 Уведомления: ВЫКЛ"
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=notification_text,
+                    callback_data="toggle_notifications"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🇷🇺 Русский",
+                    callback_data="lang_ru"
+                ),
+                InlineKeyboardButton(
+                    text="🇬🇧 English",
+                    callback_data="lang_en"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Мой профиль",
+                    callback_data="profile"
+                )
+            ]
+        ]
+    )
+
+
+def admin_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="admin_stats"
+                ),
+                InlineKeyboardButton(
+                    text="👥 Пользователи",
+                    callback_data="admin_users"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📨 Сигналы",
+                    callback_data="admin_signals"
+                ),
+                InlineKeyboardButton(
+                    text="📋 Журнал",
+                    callback_data="admin_audit"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="ℹ️ Помощь",
+                    callback_data="admin_help"
+                )
+            ]
+        ]
+    )
+
+
+# ==========================================
+# ПРОВЕРКА ДОСТУПА
+# ==========================================
+
+async def check_user(message):
+
+    if not message.from_user:
+        return False
+
+    register_user(message.from_user)
+
+    if get_status(message.from_user.id) in (
+        "blocked",
+        "suspended"
+    ):
+
+        await message.answer(
+            "⛔ Доступ временно ограничен.\n"
+            "Обратитесь в поддержку."
+        )
+
+        return False
+
+    return True
+
+
+async def check_admin(message):
+
+    if not message.from_user:
+        return False
+
+    if not is_admin(message.from_user.id):
+
+        await message.answer(
+            "⛔ Нет прав администратора."
+        )
+
+        return False
+
+    return True
+
+
+async def check_owner(message):
+
+    if not message.from_user:
+        return False
+
+    if message.from_user.id != OWNER_ID:
+
+        await message.answer(
+            "⛔ Команда доступна только владельцу."
+        )
+
+        return False
+
+    return True
+
+
+# ==========================================
+# ГЛАВНОЕ ПРИВЕТСТВИЕ
+# ==========================================
+
+async def show_main_menu(message):
+
+    await message.answer(
+        "💠 QUANTUM TRADE AI\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Добро пожаловать в будущее "
+        "интеллектуальной торговли!\n\n"
+        "📊 FOREX — аналитика валютного рынка\n"
+        "⚡ Бинарные опционы\n"
+        "📰 Новости финансового рынка\n"
+        "📅 Экономический календарь\n"
+        "📈 Торговая статистика\n"
+        "🕘 История сигналов\n"
+        "🤖 Автоматическая торговля\n"
+        "👤 Личный кабинет\n"
+        "⚙️ Персональные настройки\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Выберите нужный раздел:",
+        reply_markup=main_keyboard
+    )
+
+
+@user_dp.message(Command("start"))
+async def start_handler(message: Message):
+
+    register_user(message.from_user)
+
+    if not await check_user(message):
+        return
+
+    loading = await message.answer(
+        "💠 QUANTUM TRADE AI\n\n"
+        "Инициализация системы ░░░░░░ 0%"
+    )
+
+    stages = [
+        "Загрузка ядра системы ▓░░░░░ 20%",
+        "Подключение модулей ▓▓▓░░░ 50%",
+        "Проверка профиля ▓▓▓▓▓░ 80%",
+        "Система готова ▓▓▓▓▓▓ 100%"
     ]
-BACK = [btn("⬅️ Меню", "m:home")]
 
-class UserGate(BaseMiddleware):
-    async def __call__(self, h, ev, data):
-        register(ev.from_user)
-        if get(ev.from_user.id)["status"] != "active":
-            t = "🚫 Доступ к аккаунту ограничен."
-            if isinstance(ev, CallbackQuery): await ev.answer(t, show_alert=True)
-            else: await ev.answer(t)
-            return
-        return await h(ev, data)
+    for stage in stages:
 
-async def show(cb, text, r):
-    try:
-        await cb.message.edit_text(text, reply_markup=kb(r))
-    except Exception as e:
-        if "not modified" not in str(e):
-            await cb.message.answer(text, reply_markup=kb(r))
-    await cb.answer()
+        await asyncio.sleep(0.5)
 
-@ur.message(CommandStart())
-async def u_start(m: Message):
-    if WELCOME_PHOTO:
+        await loading.edit_text(
+            "💠 QUANTUM TRADE AI\n\n" + stage
+        )
+
+    await show_main_menu(message)
+
+
+# ==========================================
+# FOREX
+# ==========================================
+
+@user_dp.message(F.text == "📊 FOREX")
+async def forex_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    await message.answer(
+        "📊 QUANTUM FOREX AI\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🌍 АНАЛИТИКА ВАЛЮТНОГО РЫНКА\n\n"
+        "💱 Валютные пары\n"
+        "📈 Анализ рынка\n"
+        "🎯 Торговые сигналы\n"
+        "📊 Статистика\n\n"
+        "🟡 Источник реальных котировок "
+        "пока не подключён."
+    )
+
+
+# ==========================================
+# БИНАРНЫЕ ОПЦИОНЫ
+# ==========================================
+
+@user_dp.message(F.text == "⚡ Бинарные опционы")
+async def options_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    await message.answer(
+        "⚡ QUANTUM OPTIONS AI\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 АНАЛИТИКА БИНАРНЫХ ОПЦИОНОВ\n\n"
+        "📊 Анализ инструментов\n"
+        "🔔 Торговые сигналы\n"
+        "⏱ Таймфреймы M1 / M5 / M15\n"
+        "📈 История сигналов\n"
+        "📉 Статистика\n\n"
+        "🟡 Источник сигналов подключён через SIGNALS PRO."
+    )
+
+
+# ==========================================
+# НОВОСТИ
+# ==========================================
+
+@user_dp.message(F.text == "📰 Новости")
+async def news_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    await message.answer(
+        "📰 QUANTUM MARKET NEWS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "💵 Валютный рынок\n"
+        "₿ Криптовалюты\n"
+        "🏦 Центральные банки\n"
+        "📈 Фондовые рынки\n"
+        "🌍 Мировая экономика\n\n"
+        "🟡 Новостной источник пока не подключён."
+    )
+
+
+# ==========================================
+# ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ
+# ==========================================
+
+@user_dp.message(F.text == "📅 Экономический календарь")
+async def calendar_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    await message.answer(
+        "📅 ECONOMIC CALENDAR\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🔴 Высокая важность\n"
+        "🟡 Средняя важность\n"
+        "🟢 Низкая важность\n\n"
+        "В календаре будут отображаться:\n"
+        "• Время события\n"
+        "• Страна и валюта\n"
+        "• Название события\n"
+        "• Прогноз\n"
+        "• Фактическое значение\n\n"
+        "🟡 Источник календаря пока не подключён."
+    )
+
+
+# ==========================================
+# СТАТИСТИКА
+# ==========================================
+
+@user_dp.message(F.text == "📈 Статистика")
+async def statistics_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    with connect_db() as conn:
+
+        total = conn.execute(
+            "SELECT COUNT(*) FROM signals"
+        ).fetchone()[0]
+
+    await message.answer(
+        "📈 QUANTUM PERFORMANCE\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📨 Опубликовано сигналов: {total}\n\n"
+        "Результаты WIN / LOSS и процент успешности "
+        "будут рассчитываться после подключения "
+        "учёта фактических исходов.\n\n"
+        "⚠️ Непроверенные результаты не отображаются."
+    )
+
+
+# ==========================================
+# ИСТОРИЯ СИГНАЛОВ
+# ==========================================
+
+@user_dp.message(F.text == "🕘 История сигналов")
+async def history_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    with connect_db() as conn:
+
+        rows = conn.execute("""
+            SELECT id, instrument, direction,
+                   timeframe, details, created_at
+            FROM signals
+            ORDER BY id DESC
+            LIMIT 10
+        """).fetchall()
+
+    if not rows:
+
+        await message.answer(
+            "🕘 История сигналов пока пуста."
+        )
+
+        return
+
+    text = "🕘 ИСТОРИЯ СИГНАЛОВ\n━━━━━━━━━━━━━━━━━━\n"
+
+    for row in rows:
+
+        text += (
+            f"\n#{row[0]} | {row[1]}\n"
+            f"Направление: {row[2]}\n"
+            f"Таймфрейм: {row[3]}\n"
+            f"Комментарий: {row[4]}\n"
+            f"Время UTC: {row[5]}\n"
+            "──────────────\n"
+        )
+
+    await message.answer(text)
+
+
+# ==========================================
+# АВТОМАТИЧЕСКИЙ БОТ
+# ==========================================
+
+@user_dp.message(F.text == "🤖 Автоматический бот")
+async def autotrade_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📝 Регистрация в Intrade Bar",
+                    url="https://go.intrade.bar/n4FmpAFBYfvE"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📩 Поддержка брокера",
+                    url="https://t.me/copy_broker_BO_bot"
+                )
+            ]
+        ]
+    )
+
+    await message.answer(
+        "🤖 QUANTUM TRADE AI — АВТОТРЕЙД\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Для подключения необходимо иметь аккаунт "
+        "у брокера Intrade Bar.\n\n"
+        "Если у вас ещё нет аккаунта, пройдите регистрацию "
+        "по кнопке ниже.\n\n"
+        "Если аккаунт уже есть, обратитесь в поддержку "
+        "брокера и уточните условия подключения "
+        "к партнёрской программе.\n\n"
+        "После этого свяжитесь с администратором "
+        "QUANTUM TRADE AI для получения инструкции.",
+        reply_markup=keyboard
+    )
+
+
+# ==========================================
+# ЛИЧНЫЙ ПРОФИЛЬ
+# ==========================================
+
+@user_dp.message(F.text == "👤 Мой профиль")
+async def profile_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    user = get_user(message.from_user.id)
+
+    username = (
+        "@" + user[1]
+        if user[1]
+        else "не указан"
+    )
+
+    registration = user[6].replace("T", " ")[:16]
+
+    status = {
+        "active": "🟢 ACTIVE",
+        "blocked": "🔴 BLOCKED",
+        "suspended": "🟡 SUSPENDED"
+    }.get(user[3], user[3])
+
+    await message.answer(
+        "👤 ЛИЧНЫЙ КАБИНЕТ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 ID: {user[0]}\n"
+        f"👤 Имя: {user[2]}\n"
+        f"🌐 Username: {username}\n"
+        f"📅 Регистрация: {registration} UTC\n"
+        f"🔐 Статус: {status}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💠 QUANTUM TRADE AI"
+    )
+
+
+# ==========================================
+# НАСТРОЙКИ
+# ==========================================
+
+@user_dp.message(F.text == "⚙️ Настройки")
+async def settings_handler(message: Message):
+
+    if not await check_user(message):
+        return
+
+    user = get_user(message.from_user.id)
+
+    await message.answer(
+        "⚙️ QUANTUM SETTINGS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Персональные настройки аккаунта:",
+        reply_markup=settings_keyboard(bool(user[4]))
+    )
+
+
+@user_dp.callback_query(F.data == "toggle_notifications")
+async def toggle_notifications(callback: CallbackQuery):
+
+    if get_status(callback.from_user.id) != "active":
+        await callback.answer("Доступ ограничен.", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+
+    if not user:
+        await callback.answer("Сначала нажмите /start.", show_alert=True)
+        return
+
+    enabled = not bool(user[4])
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "UPDATE users SET notifications=? WHERE user_id=?",
+            (int(enabled), callback.from_user.id)
+        )
+
+    user = get_user(callback.from_user.id)
+
+    await callback.message.edit_reply_markup(
+        reply_markup=settings_keyboard(bool(user[4]))
+    )
+
+    await callback.answer(
+        "Уведомления включены."
+        if enabled else
+        "Уведомления отключены."
+    )
+
+
+@user_dp.callback_query(F.data.in_(["lang_ru", "lang_en"]))
+async def language_handler(callback: CallbackQuery):
+
+    language = (
+        "ru" if callback.data == "lang_ru"
+        else "en"
+    )
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "UPDATE users SET language=? WHERE user_id=?",
+            (language, callback.from_user.id)
+        )
+
+    await callback.answer(
+        "Выбран русский язык."
+        if language == "ru"
+        else "English selected. Full translation will be added separately."
+    )
+
+
+@user_dp.callback_query(F.data == "profile")
+async def profile_callback(callback: CallbackQuery):
+
+    user = get_user(callback.from_user.id)
+
+    if not user:
+        await callback.answer("Сначала нажмите /start.", show_alert=True)
+        return
+
+    username = "@" + user[1] if user[1] else "не указан"
+
+    await callback.message.answer(
+        "👤 МОЙ ПРОФИЛЬ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 ID: {user[0]}\n"
+        f"👤 Имя: {user[2]}\n"
+        f"🌐 Username: {username}\n"
+        f"🔐 Статус: {user[3]}\n"
+        f"📅 Регистрация: {user[6]}"
+    )
+
+    await callback.answer()
+
+
+# ==========================================
+# SIGNALS PRO — АВТОМАТИЧЕСКАЯ ПЕРЕСЫЛКА
+# ==========================================
+
+@user_dp.channel_post(F.chat.id == SOURCE_CHANNEL_ID)
+async def signals_pro_handler(message: Message, bot: Bot):
+
+    """
+    Получает новые публикации из SIGNALS PRO
+    и копирует их пользователям QUANTUM TRADE AI.
+
+    Поддерживаются текст, фото, видео и другие
+    типы публикаций, которые поддерживает copy_message.
+    """
+
+    log.info(
+        "Получена публикация SIGNALS PRO. Message ID: %s",
+        message.message_id
+    )
+
+    with connect_db() as conn:
+
+        recipients = conn.execute("""
+            SELECT user_id
+            FROM users
+            WHERE status='active' AND notifications=1
+        """).fetchall()
+
+    sent = 0
+    failed = 0
+
+    for recipient in recipients:
+
+        user_id = recipient[0]
+
         try:
-            await m.answer_photo(WELCOME_PHOTO, caption=WELCOME, reply_markup=kb(menu())); return
-        except Exception as e: logging.warning("photo: %s", e)
-    await m.answer(WELCOME, reply_markup=kb(menu()))
 
-@ur.callback_query(lambda c: c.data == "m:home")
-async def u_home(c: CallbackQuery):
-    try: await c.message.delete()
-    except Exception: pass
-    await c.message.answer("⚡ <b>QUANTUM TRADE AI</b>\nВыберите раздел:", reply_markup=kb(menu())); await c.answer()
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=SOURCE_CHANNEL_ID,
+                message_id=message.message_id
+            )
 
-@ur.callback_query(lambda c: c.data.startswith("m:fx:"))
-async def u_fx(c: CallbackQuery):
-    p = int(c.data.split(":")[2]); per = 14
-    r = await rates()
-    if not r: return await c.answer("Курсы временно недоступны", show_alert=True)
-    part = ORDER[p * per:(p + 1) * per]
-    lines = [f"<code>{a}/{b}</code>  <b>{fp(r[b] / r[a])}</b>" for a, b in part if a in r and b in r]
-    pages = (len(ORDER) + per - 1) // per
-    nav = []
-    if p > 0: nav.append(btn("◀️", f"m:fx:{p-1}"))
-    nav.append(btn(f"{p+1}/{pages}", "m:noop"))
-    if p < pages - 1: nav.append(btn("▶️", f"m:fx:{p+1}"))
-    await show(c, f"📊 <b>Форекс — все валютные пары</b>\n\n" + "\n".join(lines) + "\n\n<i>Обновление раз в минуту</i>",
-               [nav, [btn("💱 Курсы к рублю", "m:cash"), btn("📉 Графики", "m:chart")], BACK])
+            sent += 1
 
-@ur.callback_query(lambda c: c.data == "m:noop")
-async def u_noop(c: CallbackQuery): await c.answer()
+            await asyncio.sleep(0.05)
 
-@ur.callback_query(lambda c: c.data == "m:cash")
-async def u_cash(c: CallbackQuery):
-    r = await rates()
-    if not r: return await c.answer("Курсы временно недоступны", show_alert=True)
-    L = [f"{x}: <b>{r['RUB'] / r[x]:.2f} ₽</b>" for x in ["USD", "EUR", "GBP", "CHF", "JPY", "CNY", "TRY", "CAD", "AUD"]]
-    await show(c, "💱 <b>Курсы валют к рублю</b>\n\n" + "\n".join(L), [[btn("📊 Все пары", "m:fx:0")], BACK])
+        except TelegramAPIError as error:
 
-@ur.callback_query(lambda c: c.data == "m:chart")
-async def u_chart(c: CallbackQuery):
-    r, row = [], []
-    for a, b in MAJORS:
-        row.append(btn(f"{a}/{b}", url=tv(a, b)))
-        if len(row) == 2: r.append(row); row = []
-    r.append([btn("📺 Investing.com — котировки", url="https://ru.investing.com/currencies/streaming-forex-rates-majors")])
-    r.append(BACK)
-    await show(c, "📉 <b>Живые графики</b> (TradingView)\nВыберите пару:", r)
+            failed += 1
 
-@ur.callback_query(lambda c: c.data == "m:cal")
-async def u_cal(c: CallbackQuery):
-    await show(c, "📅 <b>Экономический календарь</b>\nВажные события, прогнозы и факты в реальном времени.",
-               [[btn("📅 Investing.com", url="https://ru.investing.com/economic-calendar/")],
-                [btn("📅 TradingView", url="https://ru.tradingview.com/economic-calendar/")], BACK])
+            log.warning(
+                "Ошибка отправки публикации пользователю %s: %s",
+                user_id,
+                error
+            )
 
-@ur.callback_query(lambda c: c.data == "m:news")
-async def u_news(c: CallbackQuery):
-    items = await fetch_news()
-    if not items: return await c.answer("Новости временно недоступны", show_alert=True)
-    L = [f"• <a href=\"{l}\">{html.escape(t)}</a>" for _, t, l in items[:8]]
-    await show(c, "📰 <b>Свежие новости</b>\n\n" + "\n\n".join(L), [[btn("🔄 Обновить", "m:news")], BACK])
+    # Сохраняем публикацию в историю.
+    post_text = message.text or message.caption or ""
 
-@ur.callback_query(lambda c: c.data == "m:bin")
-async def u_bin(c: CallbackQuery):
-    s = rows("select * from signals order by id desc limit 5")
-    L = []
-    for x in s:
-        res = {"win": "✅", "loss": "❌"}.get(x["result"], "⏳")
-        L.append(f"{res} #{x['id']} <b>{x['pair']}</b> {'⬆️ ВВЕРХ' if x['dir']=='UP' else '⬇️ ВНИЗ'} · {x['exp']} · {tfmt(x['ts'])}")
-    txt = "⚡ <b>Бинарные опционы — сигналы</b>\n\n" + ("\n".join(L) if L else "Пока нет сигналов. Новые придут автоматически.") + "\n\n" + RISK
-    await show(c, txt, [[btn("📈 Статистика", "m:stat")], BACK])
+    with connect_db() as conn:
 
-def stat_text():
-    t = one("select count(*) n, sum(result='win') w, sum(result='loss') l from signals")
-    w, l = t["w"] or 0, t["l"] or 0
-    wr = f"{w * 100 / (w + l):.1f}%" if w + l else "—"
-    return f"📈 <b>Статистика сигналов</b>\n\nВсего: <b>{t['n']}</b>\n✅ Плюс: <b>{w}</b>\n❌ Минус: <b>{l}</b>\n🎯 Винрейт: <b>{wr}</b>"
+        conn.execute("""
+            INSERT INTO signals
+            (instrument, direction, timeframe, details,
+             created_at, created_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            "SIGNALS PRO",
+            "CHANNEL POST",
+            "-",
+            post_text[:3000],
+            now(),
+            0
+        ))
 
-@ur.callback_query(lambda c: c.data == "m:stat")
-async def u_stat(c: CallbackQuery): await show(c, stat_text(), [BACK])
+    log.info(
+        "SIGNALS PRO: публикация %s обработана. Доставлено: %s. Ошибок: %s",
+        message.message_id,
+        sent,
+        failed
+    )
 
-@ur.callback_query(lambda c: c.data == "m:auto")
-async def u_auto(c: CallbackQuery):
-    txt = (f"🤖 <b>АВТОМАТИЧЕСКИЙ БОТ (АВТОТРЕЙД)</b>\n\nЧтобы подключить автобота, нужно быть партнёром у брокера Intrade Bar.\n\n"
-           f"1️⃣ Напишите в поддержку брокера Intrade Bar и попросите перевести вас под ID: <code>{AUTOTRADE_ID}</code>\n\n"
-           f"2️⃣ Если нет регистрации — ссылка:\n{BROKER_LINK}\n\n3️⃣ Затем нажмите «Подать заявку».")
-    await show(c, txt, [[btn("📨 Подать заявку", "m:req", style="success")], [btn("🎧 Написать в поддержку", url=SUPPORT_URL)], BACK])
 
-@ur.callback_query(lambda c: c.data == "m:req")
-async def u_req(c: CallbackQuery):
-    uid = c.from_user.id
-    if one("select 1 from requests where uid=? and status='pending'", uid):
-        return await c.answer("Ваша заявка уже на рассмотрении ⏳", show_alert=True)
-    rid = q("insert into requests(uid,ts) values(?,?)", uid, now()).lastrowid
-    for r in rows("select id from users where role in ('admin','owner') and status='active'"):
+# ==========================================
+# АДМИНИСТРАТИВНЫЙ БОТ
+# ==========================================
+
+@admin_dp.message(Command("start", "panel"))
+async def admin_start(message: Message):
+
+    if not await check_admin(message):
+        return
+
+    await message.answer(
+        "🛡 QUANTUM TRADE AI\n"
+        "ПАНЕЛЬ УПРАВЛЕНИЯ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Выберите нужный раздел:",
+        reply_markup=admin_keyboard()
+    )
+
+
+@admin_dp.message(Command("help"))
+async def admin_help(message: Message):
+
+    if not await check_admin(message):
+        return
+
+    await message.answer(
+        "🛡 КОМАНДЫ АДМИНИСТРАТОРА\n\n"
+        "/panel — панель управления\n"
+        "/stats — статистика\n"
+        "/users — пользователи\n"
+        "/signal — публикация сигнала\n"
+        "/broadcast — рассылка\n"
+        "/ban ID — блокировка\n"
+        "/unban ID — разблокировка\n"
+        "/suspend ID — приостановка\n"
+        "/restore ID — восстановление\n"
+        "/audit — журнал\n\n"
+        "Команды владельца:\n"
+        "/addadmin ID\n"
+        "/removeadmin ID\n"
+        "/adminlist"
+    )
+
+
+# ==========================================
+# СТАТИСТИКА АДМИНИСТРАТОРА
+# ==========================================
+
+@admin_dp.message(Command("stats"))
+async def admin_stats(message: Message):
+
+    if not await check_admin(message):
+        return
+
+    with connect_db() as conn:
+
+        total = conn.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        active = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE status='active'"
+        ).fetchone()[0]
+
+        blocked = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE status='blocked'"
+        ).fetchone()[0]
+
+        signals = conn.execute(
+            "SELECT COUNT(*) FROM signals"
+        ).fetchone()[0]
+
+    await message.answer(
+        "📊 СТАТИСТИКА ПЛАТФОРМЫ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Всего пользователей: {total}\n"
+        f"🟢 Активных: {active}\n"
+        f"🔴 Заблокированных: {blocked}\n"
+        f"📨 Сигналов: {signals}"
+    )
+
+
+# ==========================================
+# ПОЛЬЗОВАТЕЛИ
+# ==========================================
+
+@admin_dp.message(Command("users"))
+async def admin_users(message: Message):
+
+    if not await check_admin(message):
+        return
+
+    with connect_db() as conn:
+
+        rows = conn.execute("""
+            SELECT user_id, username, full_name, status
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT 30
+        """).fetchall()
+
+    if not rows:
+
+        await message.answer("Пользователей пока нет.")
+
+        return
+
+    text = "👥 ПОЛЬЗОВАТЕЛИ\n━━━━━━━━━━━━━━━━━━\n"
+
+    for row in rows:
+
+        text += (
+            f"\nID: {row[0]}\n"
+            f"Имя: {row[2]}\n"
+            f"Username: @{row[1] or 'нет'}\n"
+            f"Статус: {row[3]}\n"
+        )
+
+    await message.answer(text)
+
+
+# ==========================================
+# ПУБЛИКАЦИЯ СИГНАЛОВ
+# ==========================================
+
+@admin_dp.message(Command("signal"))
+async def publish_signal(message: Message, bot: Bot):
+
+    if not await check_admin(message):
+        return
+
+    parts = (message.text or "").split(maxsplit=4)
+
+    if len(parts) < 4:
+
+        await message.answer(
+            "Формат команды:\n\n"
+            "/signal BTC/USDT BUY M5 комментарий\n\n"
+            "Направление: BUY или SELL."
+        )
+
+        return
+
+    instrument = parts[1].upper()
+    direction = parts[2].upper()
+    timeframe = parts[3].upper()
+
+    details = (
+        parts[4]
+        if len(parts) > 4
+        else "Без комментария"
+    )
+
+    if direction not in ("BUY", "SELL", "CALL", "PUT"):
+
+        await message.answer(
+            "Направление должно быть BUY, SELL, CALL или PUT."
+        )
+
+        return
+
+    with connect_db() as conn:
+
+        cursor = conn.execute("""
+            INSERT INTO signals
+            (instrument, direction, timeframe, details,
+             created_at, created_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            instrument,
+            direction,
+            timeframe,
+            details,
+            now(),
+            message.from_user.id
+        ))
+
+        signal_id = cursor.lastrowid
+
+        recipients = conn.execute("""
+            SELECT user_id
+            FROM users
+            WHERE status='active' AND notifications=1
+        """).fetchall()
+
+    text = (
+        "🔔 НОВЫЙ СИГНАЛ QUANTUM TRADE AI\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 Инструмент: {instrument}\n"
+        f"🎯 Направление: {direction}\n"
+        f"⏱ Таймфрейм: {timeframe}\n"
+        f"📝 Комментарий: {details}\n"
+        f"🆔 Сигнал №{signal_id}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ Информационный сигнал. "
+        "Не является гарантией результата."
+    )
+
+    sent = 0
+    failed = 0
+
+    for recipient in recipients:
+
         try:
-            await ab.send_message(r["id"], f"📨 Новая заявка автотрейд #{rid}\n{fu(get(uid))}",
-                                  reply_markup=kb([[btn("✅ Одобрить", f"r:ok:{rid}", style="success"), btn("❌ Отклонить", f"r:no:{rid}", style="danger")]]))
-        except Exception: pass
-    await c.answer("Заявка отправлена ✅", show_alert=True)
 
-@ur.callback_query(lambda c: c.data == "m:set")
-async def u_set(c: CallbackQuery):
-    on = get(c.from_user.id)["news"]
-    await show(c, "⚙️ <b>Настройки</b>", [[btn(f"🔔 Новости: {'ВКЛ' if on else 'ВЫКЛ'}", "m:tn")], BACK])
+            await bot.send_message(
+                recipient[0],
+                text
+            )
 
-@ur.callback_query(lambda c: c.data == "m:tn")
-async def u_tn(c: CallbackQuery):
-    q("update users set news=1-news where id=?", c.from_user.id); await u_set(c)
+            sent += 1
 
-@ur.callback_query(lambda c: c.data == "m:prof")
-async def u_prof(c: CallbackQuery):
-    r = get(c.from_user.id)
-    lab = {"owner": "👑 Владелец", "admin": "🔐 Администратор", "user": "Пользователь"}[r["role"]]
-    await show(c, f"👤 <b>Мой профиль</b>\n\nID: <code>{r['id']}</code>\nИмя: {html.escape(r['name'] or '-')}\nСтатус: {lab}\nС нами с: {tfmt(r['joined'])}", [BACK])
+            await asyncio.sleep(0.05)
 
-# ───────────────────────── ADMIN BOT ─────────────────────────
-pend = {}
+        except TelegramAPIError:
 
-class AdminGate(BaseMiddleware):
-    async def __call__(self, h, ev, data):
-        uid = ev.from_user.id
-        if isinstance(ev, CallbackQuery) and (ev.data or "").startswith("t:"): return await h(ev, data)
-        if arole(uid) in ("admin", "owner"): return await h(ev, data)
-        if isinstance(ev, CallbackQuery): await ev.answer("⛔ Нет доступа", show_alert=True)
-        else: await ev.answer("⛔ Нет доступа.")
+            failed += 1
 
-def is_owner(uid): return arole(uid) == "owner"
+    audit(
+        message.from_user.id,
+        "publish_signal",
+        signal_id
+    )
 
-def can_act(actor, t):
-    if actor == t: return False, "⛔ Нельзя применить к себе."
-    r = one("select role from users where id=?", t)
-    if r and r["role"] == "owner": return False, "⛔ Нельзя трогать владельца."
-    if r and r["role"] == "admin" and not is_owner(actor): return False, "⛔ Только владелец управляет администраторами."
-    return True, ""
+    await message.answer(
+        f"✅ Сигнал №{signal_id} опубликован.\n\n"
+        f"Доставлено: {sent}\n"
+        f"Ошибок доставки: {failed}"
+    )
 
-def tid(c: CommandObject):
-    try: return int(c.args.split()[0])
-    except Exception: return None
 
-async def confirm(m, act, args, text):
-    tok = secrets.token_hex(4)
-    pend[tok] = (act, args, m.from_user.id, time.time())
-    await m.answer(f"⚠️ <b>Подтвердите действие</b>\n\n{text}",
-                   reply_markup=kb([[btn("✅ Подтвердить", f"c:{tok}:y", style="success"), btn("❌ Отмена", f"c:{tok}:n", style="danger")]]))
+# ==========================================
+# РАССЫЛКА
+# ==========================================
 
-async def execute(act, a, actor):
-    if act in ("ban", "unban", "suspend", "restore"):
-        t = a[0]; ok, msg = can_act(actor, t)
-        if not ok: return msg
-        if not get(t): return "❌ Пользователь не найден."
-        if act == "ban": q("update users set status='banned', until=0 where id=?", t)
-        elif act == "suspend": q("update users set status='suspended', until=? where id=?", now() + a[1] * 3600, t)
-        else: q("update users set status='active', until=0 where id=?", t)
-        log(actor, t, act, str(a[1:])); return f"✅ {act}: {t}"
-    if act == "addadmin":
-        if not is_owner(actor): return "⛔ Только владелец."
-        t = a[0]
-        if arole(t) == "owner": return "Это владелец."
-        q("insert or ignore into users(id,joined) values(?,?)", t, now())
-        q("update users set role='admin' where id=?", t); log(actor, t, "addadmin"); return f"✅ Администратор назначен: {t}"
-    if act == "removeadmin":
-        if not is_owner(actor): return "⛔ Только владелец."
-        t = a[0]
-        if one("select role from users where id=?", t)["role"] == "owner": return "⛔ Нельзя снять владельца."
-        q("update users set role='user' where id=?", t); log(actor, t, "removeadmin"); return f"✅ Права сняты: {t}"
-    if act == "broadcast":
-        n = await bcast(a[0]); log(actor, 0, "broadcast", a[0][:100]); return f"📢 Отправлено: {n}"
-    if act == "own1":
-        tok = secrets.token_hex(4); pend[tok] = ("own2", a, actor, time.time())
-        await ab.send_message(actor, f"🚨 <b>ВТОРОЕ подтверждение</b>\nПередать владение платформой <code>{a[0]}</code>?\nВы потеряете статус владельца.",
-                              reply_markup=kb([[btn("✅ ДА, передать", f"c:{tok}:y", style="danger"), btn("❌ Отмена", f"c:{tok}:n")]]))
-        return "Запрошено второе подтверждение."
-    if act == "own2":
-        if not is_owner(actor): return "⛔ Только владелец."
-        new = a[0]
-        tr = q("insert into transfers(old,new,status,ts) values(?,?,?,?)", actor, new, "pending", now()).lastrowid
+@admin_dp.message(Command("broadcast"))
+async def broadcast(message: Message, bot: Bot):
+
+    if not await check_admin(message):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) < 2:
+
+        await message.answer(
+            "Формат:\n/broadcast Текст сообщения"
+        )
+
+        return
+
+    with connect_db() as conn:
+
+        users = conn.execute("""
+            SELECT user_id
+            FROM users
+            WHERE status='active' AND notifications=1
+        """).fetchall()
+
+    sent = 0
+    failed = 0
+
+    for user in users:
+
         try:
-            await ab.send_message(new, f"👑 Вам предлагают стать <b>владельцем</b> QUANTUM TRADE AI.\nОт: <code>{actor}</code>\nПринять?",
-                                  reply_markup=kb([[btn("✅ Принять", f"t:acc:{tr}", style="success"), btn("❌ Отказаться", f"t:dec:{tr}", style="danger")]]))
-        except Exception:
-            q("update transfers set status='failed' where id=?", tr)
-            return "❌ Новый владелец должен сначала нажать /start в админ-боте."
-        log(actor, new, "ownertransfer_request"); return "📨 Запрос отправлен. Ждём принятия."
-    return "?"
 
-@ar.callback_query(lambda c: c.data.startswith("c:"))
-async def a_confirm(c: CallbackQuery):
-    _, tok, ans = c.data.split(":")
-    p = pend.get(tok)
-    if not p or p[2] != c.from_user.id or time.time() - p[3] > 300:
-        return await c.answer("Запрос устарел", show_alert=True)
-    pend.pop(tok)
-    if ans == "n": await c.message.edit_text("❌ Отменено."); return await c.answer()
-    res = await execute(p[0], p[1], p[2])
-    await c.message.edit_text(res); await c.answer()
+            await bot.send_message(
+                user[0],
+                parts[1]
+            )
 
-@ar.callback_query(lambda c: c.data.startswith("t:"))
-async def a_transfer(c: CallbackQuery):
-    _, ans, tr = c.data.split(":")
-    r = one("select * from transfers where id=?", int(tr))
-    if not r or r["status"] != "pending" or r["new"] != c.from_user.id:
-        return await c.answer("Недействительно", show_alert=True)
-    if ans == "dec":
-        q("update transfers set status='declined' where id=?", r["id"]); log(r["new"], r["old"], "ownertransfer_declined")
-        await c.message.edit_text("❌ Вы отказались."); await ab.send_message(r["old"], "❌ Передача владения отклонена."); return
-    if not is_owner(r["old"]): return await c.answer("Отправитель уже не владелец", show_alert=True)
-    q("insert or ignore into users(id,joined) values(?,?)", r["new"], now())
-    q("update users set role='user' where id=?", r["old"])
-    q("update users set role='owner', status='active', until=0 where id=?", r["new"])
-    q("update transfers set status='done' where id=?", r["id"]); log(r["old"], r["new"], "ownertransfer_done")
-    await c.message.edit_text("👑 Вы теперь ВЛАДЕЛЕЦ платформы.")
-    try: await ab.send_message(r["old"], f"✅ Владение передано <code>{r['new']}</code>. Ваш статус: пользователь.")
-    except Exception: pass
-    await c.answer()
+            sent += 1
 
-HELP = ("🔐 <b>Команды</b>\n/admin /users /user ID /ban ID /unban ID /suspend ID [часы] /restore ID\n"
-        "/stats /signals /broadcast текст /requests /audit /admins /help\n"
-        "/signal ПАРА UP|DOWN ЭКСП — выдать сигнал\n/result ID win|loss — результат\n\n"
-        "👑 <b>Владелец</b>\n/addadmin ID /removeadmin ID /adminlist /ownertransfer ID /ownerinfo")
+            await asyncio.sleep(0.05)
 
-def panel(uid):
-    r = [[btn("👥 Пользователи", "p:users", style="primary"), btn("📊 Статистика", "p:stats", style="primary")],
-         [btn("📨 Заявки", "p:req", style="success"), btn("📋 Журнал", "p:audit")],
-         [btn("👥 Админы", "p:admins"), btn("❓ Помощь", "p:help")]]
-    return kb(r)
+        except TelegramAPIError:
 
-def users_text():
-    L = [fu(r) for r in rows("select * from users order by joined desc limit 30")]
-    return f"👥 <b>Пользователи</b> (последние 30)\n\n" + "\n".join(L)
+            failed += 1
 
-def stats_text():
-    t = one("select count(*) n, sum(status='active') a, sum(status='banned') b, sum(status='suspended') s from users")
-    rq = one("select count(*) n from requests where status='pending'")["n"]
-    return (f"📊 <b>Статистика платформы</b>\n\nПользователей: <b>{t['n']}</b>\nАктивных: {t['a']}\nЗаблокировано: {t['b']}\n"
-            f"Приостановлено: {t['s']}\nЗаявок автотрейд в ожидании: {rq}\n\n" + stat_text())
+    audit(message.from_user.id, "broadcast")
 
-def audit_text():
-    L = [f"{tfmt(r['ts'])} · {r['actor']} → {r['target']} · <b>{r['action']}</b> {html.escape(r['details'] or '')}"
-         for r in rows("select * from audit order by id desc limit 20")]
-    return "📋 <b>Журнал действий</b>\n\n" + ("\n".join(L) or "Пусто")
+    await message.answer(
+        "📢 РАССЫЛКА ЗАВЕРШЕНА\n\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
 
-def admins_text():
-    return "👥 <b>Администраторы</b>\n\n" + "\n".join(fu(r) for r in rows("select * from users where role in ('owner','admin')"))
 
-def req_data():
-    rs = rows("select * from requests where status='pending' order by id limit 10")
-    if not rs: return "📨 Заявок нет.", None
-    btns = [[btn(f"✅ #{r['id']} · {r['uid']}", f"r:ok:{r['id']}", style="success"), btn(f"❌ #{r['id']}", f"r:no:{r['id']}", style="danger")] for r in rs]
-    return "📨 <b>Заявки на автотрейд</b>", kb(btns)
+# ==========================================
+# БЛОКИРОВКА ПОЛЬЗОВАТЕЛЕЙ
+# ==========================================
 
-@ar.message(CommandStart())
-@ar.message(Command("admin"))
-async def a_admin(m: Message):
-    await m.answer("⚡ <b>QUANTUM TRADE AI — ADMIN PANEL</b>\nИнтеллект. Контроль. Технологии.", reply_markup=panel(m.from_user.id))
+async def change_status(message, status):
 
-@ar.message(Command("help"))
-async def a_help(m: Message): await m.answer(HELP)
+    if not await check_admin(message):
+        return
 
-@ar.callback_query(lambda c: c.data.startswith("p:"))
-async def a_panel(c: CallbackQuery):
-    k = c.data[2:]
-    if k == "req":
-        t, mk = req_data(); await c.message.answer(t, reply_markup=mk)
-    else:
-        t = {"users": users_text, "stats": stats_text, "audit": audit_text, "admins": admins_text}.get(k, lambda: HELP)()
-        await c.message.answer(t)
-    await c.answer()
+    parts = (message.text or "").split()
 
-@ar.message(Command("users"))
-async def a_users(m: Message): await m.answer(users_text())
-@ar.message(Command("stats"))
-async def a_stats(m: Message): await m.answer(stats_text())
-@ar.message(Command("signals"))
-async def a_signals(m: Message): await m.answer(stat_text())
-@ar.message(Command("audit"))
-async def a_audit(m: Message): await m.answer(audit_text())
-@ar.message(Command("admins"))
-async def a_admins(m: Message): await m.answer(admins_text())
+    if len(parts) != 2 or not parts[1].isdigit():
 
-@ar.message(Command("user"))
-async def a_user(m: Message, command: CommandObject):
-    t = tid(command); r = get(t) if t else None
-    if not r: return await m.answer("Использование: /user ID (не найден)")
-    await m.answer(fu(r) + f"\nС: {tfmt(r['joined'])}" + (f"\nДо: {tfmt(r['until'])}" if r["until"] else ""))
+        await message.answer(
+            "Укажите ID пользователя."
+        )
 
-def mk_cmd(name, label):
-    @ar.message(Command(name))
-    async def h(m: Message, command: CommandObject):
-        t = tid(command)
-        if not t: return await m.answer(f"Использование: /{name} ID")
-        ok, msg = can_act(m.from_user.id, t)
-        if not ok: return await m.answer(msg)
-        hours = 24
-        if name == "suspend":
-            try: hours = int(command.args.split()[1])
-            except Exception: pass
-        args = (t, hours) if name == "suspend" else (t,)
-        if name in ("ban", "suspend"): await confirm(m, name, args, f"{label} <code>{t}</code>" + (f" на {hours} ч." if name == "suspend" else ""))
-        else: await m.answer(await execute(name, args, m.from_user.id))
-for n, l in [("ban", "🔴 Заблокировать"), ("unban", "🟢 Разблокировать"), ("suspend", "🟡 Приостановить"), ("restore", "♻️ Восстановить")]:
-    mk_cmd(n, l)
+        return
 
-@ar.message(Command("broadcast"))
-async def a_bc(m: Message, command: CommandObject):
-    if not command.args: return await m.answer("Использование: /broadcast текст")
-    await confirm(m, "broadcast", (command.args,), f"📢 Рассылка всем активным:\n\n{html.escape(command.args)}")
+    user_id = int(parts[1])
 
-@ar.message(Command("requests"))
-async def a_req(m: Message):
-    t, mk = req_data(); await m.answer(t, reply_markup=mk)
+    if user_id == OWNER_ID:
 
-@ar.callback_query(lambda c: c.data.startswith("r:"))
-async def a_req_cb(c: CallbackQuery):
-    _, ans, rid = c.data.split(":")
-    r = one("select * from requests where id=?", int(rid))
-    if not r or r["status"] != "pending": return await c.answer("Уже обработана", show_alert=True)
-    st = "approved" if ans == "ok" else "rejected"
-    q("update requests set status=? where id=?", st, r["id"]); log(c.from_user.id, r["uid"], "request_" + st, f"#{r['id']}")
-    try:
-        await ub.send_message(r["uid"], "✅ Ваша заявка на автотрейд одобрена!" if ans == "ok" else "❌ Ваша заявка на автотрейд отклонена.")
-    except Exception: pass
-    await c.message.edit_text(f"{'✅ Одобрена' if ans=='ok' else '❌ Отклонена'}: заявка #{r['id']}"); await c.answer()
+        await message.answer(
+            "Нельзя изменять статус владельца."
+        )
 
-@ar.message(Command("signal"))
-async def a_signal(m: Message, command: CommandObject):
-    try:
-        pair, d, exp = command.args.split()[:3]; d = d.upper()
-        assert d in ("UP", "DOWN")
-    except Exception: return await m.answer("Использование: /signal EURUSD UP 5m")
-    sid = q("insert into signals(ts,pair,dir,exp) values(?,?,?,?)", now(), pair.upper(), d, exp).lastrowid
-    log(m.from_user.id, 0, "signal", f"#{sid}")
-    n = await bcast(f"⚡ <b>Новый сигнал #{sid}</b>\n{pair.upper()} {'⬆️ ВВЕРХ' if d=='UP' else '⬇️ ВНИЗ'} · экспирация {exp}\n\n{RISK}")
-    await m.answer(f"✅ Сигнал #{sid} разослан: {n}")
+        return
 
-@ar.message(Command("result"))
-async def a_result(m: Message, command: CommandObject):
-    try:
-        sid, res = command.args.split()[:2]; assert res in ("win", "loss")
-        assert one("select 1 from signals where id=?", int(sid))
-    except Exception: return await m.answer("Использование: /result ID win|loss")
-    q("update signals set result=? where id=?", res, int(sid)); log(m.from_user.id, 0, "result", f"#{sid} {res}")
-    await m.answer("✅ Записано")
+    set_status(user_id, status)
 
-@ar.message(Command("addadmin"))
-async def a_addadmin(m: Message, command: CommandObject):
-    if not is_owner(m.from_user.id): return await m.answer("⛔ Только владелец.")
-    t = tid(command)
-    if not t: return await m.answer("Использование: /addadmin ID")
-    await confirm(m, "addadmin", (t,), f"➕ Назначить администратором <code>{t}</code>")
+    audit(
+        message.from_user.id,
+        status,
+        user_id
+    )
 
-@ar.message(Command("removeadmin"))
-async def a_rmadmin(m: Message, command: CommandObject):
-    if not is_owner(m.from_user.id): return await m.answer("⛔ Только владелец.")
-    t = tid(command)
-    if not t: return await m.answer("Использование: /removeadmin ID")
-    await confirm(m, "removeadmin", (t,), f"➖ Снять права администратора с <code>{t}</code>")
+    await message.answer(
+        f"✅ Статус пользователя {user_id}: {status}"
+    )
 
-@ar.message(Command("adminlist"))
-async def a_adminlist(m: Message):
-    if not is_owner(m.from_user.id): return await m.answer("⛔ Только владелец.")
-    await m.answer(admins_text())
 
-@ar.message(Command("ownerinfo"))
-async def a_ownerinfo(m: Message):
-    r = one("select * from users where role='owner'"); await m.answer("👑 <b>Владелец</b>\n" + fu(r))
+@admin_dp.message(Command("ban"))
+async def ban_user(message: Message):
+    await change_status(message, "blocked")
 
-@ar.message(Command("ownertransfer"))
-async def a_ownertransfer(m: Message, command: CommandObject):
-    if not is_owner(m.from_user.id): return await m.answer("⛔ Только владелец.")
-    t = tid(command)
-    if not t or t == m.from_user.id: return await m.answer("Использование: /ownertransfer ID")
-    if not get(t): return await m.answer("❌ Пользователь не найден в базе (он должен запустить бота).")
-    await confirm(m, "own1", (t,), f"🚨 Передать ВСЕ права владельца <code>{t}</code>?\nВы станете обычным пользователем.")
 
-# ───────────────────────── ЗАПУСК ─────────────────────────
+@admin_dp.message(Command("unban"))
+async def unban_user(message: Message):
+    await change_status(message, "active")
+
+
+@admin_dp.message(Command("suspend"))
+async def suspend_user(message: Message):
+    await change_status(message, "suspended")
+
+
+@admin_dp.message(Command("restore"))
+async def restore_user(message: Message):
+    await change_status(message, "active")
+
+
+# ==========================================
+# ЖУРНАЛ
+# ==========================================
+
+@admin_dp.message(Command("audit"))
+async def audit_handler(message: Message):
+
+    if not await check_admin(message):
+        return
+
+    with connect_db() as conn:
+
+        rows = conn.execute("""
+            SELECT actor_id, action, target_id, created_at
+            FROM audit
+            ORDER BY id DESC
+            LIMIT 20
+        """).fetchall()
+
+    if not rows:
+
+        await message.answer(
+            "Журнал действий пока пуст."
+        )
+
+        return
+
+    text = "📋 ЖУРНАЛ ДЕЙСТВИЙ\n━━━━━━━━━━━━━━━━━━\n"
+
+    for row in rows:
+
+        text += (
+            f"\nАдминистратор: {row[0]}\n"
+            f"Действие: {row[1]}\n"
+            f"Пользователь: {row[2]}\n"
+            f"Дата: {row[3]}\n"
+        )
+
+    await message.answer(text)
+
+
+# ==========================================
+# УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ
+# ==========================================
+
+@admin_dp.message(Command("adminlist"))
+async def admin_list(message: Message):
+
+    if not await check_owner(message):
+        return
+
+    with connect_db() as conn:
+
+        rows = conn.execute(
+            "SELECT user_id FROM admins"
+        ).fetchall()
+
+    text = f"👑 Владелец: {OWNER_ID}\n\n"
+
+    for row in rows:
+
+        text += f"🛡 Администратор: {row[0]}\n"
+
+    await message.answer(text)
+
+
+@admin_dp.message(Command("addadmin"))
+async def add_admin(message: Message):
+
+    if not await check_owner(message):
+        return
+
+    parts = (message.text or "").split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+
+        await message.answer(
+            "Формат: /addadmin ID"
+        )
+
+        return
+
+    user_id = int(parts[1])
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "INSERT OR IGNORE INTO admins VALUES (?)",
+            (user_id,)
+        )
+
+    audit(
+        message.from_user.id,
+        "add_admin",
+        user_id
+    )
+
+    await message.answer(
+        f"✅ Администратор {user_id} добавлен."
+    )
+
+
+@admin_dp.message(Command("removeadmin"))
+async def remove_admin(message: Message):
+
+    if not await check_owner(message):
+        return
+
+    parts = (message.text or "").split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+
+        await message.answer(
+            "Формат: /removeadmin ID"
+        )
+
+        return
+
+    user_id = int(parts[1])
+
+    if user_id == OWNER_ID:
+
+        await message.answer(
+            "Нельзя удалить владельца."
+        )
+
+        return
+
+    with connect_db() as conn:
+
+        conn.execute(
+            "DELETE FROM admins WHERE user_id=?",
+            (user_id,)
+        )
+
+    audit(
+        message.from_user.id,
+        "remove_admin",
+        user_id
+    )
+
+    await message.answer(
+        f"✅ Права администратора {user_id} сняты."
+    )
+
+
+# ==========================================
+# КНОПКИ АДМИН-ПАНЕЛИ
+# ==========================================
+
+@admin_dp.callback_query(F.data.startswith("admin_"))
+async def admin_buttons(callback: CallbackQuery):
+
+    if not is_admin(callback.from_user.id):
+
+        await callback.answer(
+            "Нет прав администратора.",
+            show_alert=True
+        )
+
+        return
+
+    if callback.data == "admin_stats":
+
+        with connect_db() as conn:
+
+            total = conn.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+
+            signals = conn.execute(
+                "SELECT COUNT(*) FROM signals"
+            ).fetchone()[0]
+
+        await callback.message.answer(
+            f"📊 Пользователей: {total}\n"
+            f"📨 Сигналов: {signals}"
+        )
+
+    elif callback.data == "admin_users":
+
+        await callback.message.answer(
+            "Для просмотра пользователей используйте /users"
+        )
+
+    elif callback.data == "admin_signals":
+
+        with connect_db() as conn:
+
+            rows = conn.execute("""
+                SELECT id, instrument, direction, timeframe
+                FROM signals
+                ORDER BY id DESC
+                LIMIT 10
+            """).fetchall()
+
+        if not rows:
+
+            await callback.message.answer(
+                "Сигналов пока нет."
+            )
+
+        else:
+
+            text = "📨 ПОСЛЕДНИЕ СИГНАЛЫ\n"
+
+            for row in rows:
+
+                text += (
+                    f"\n#{row[0]} "
+                    f"{row[1]} "
+                    f"{row[2]} "
+                    f"{row[3]}"
+                )
+
+            await callback.message.answer(text)
+
+    elif callback.data == "admin_audit":
+
+        await callback.message.answer(
+            "Для просмотра журнала используйте /audit"
+        )
+
+    elif callback.data == "admin_help":
+
+        await callback.message.answer(
+            "Используйте /help для списка команд."
+        )
+
+    await callback.answer()
+
+
+# ==========================================
+# ЗАПУСК ДВУХ БОТОВ
+# ==========================================
+
 async def main():
-    global ub, ab
-    props = DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True)
-    ub, ab = Bot(TOKEN_USER, default=props), Bot(TOKEN_ADMIN, default=props)
-    ur.message.middleware(UserGate()); ur.callback_query.middleware(UserGate())
-    ar.message.middleware(AdminGate()); ar.callback_query.middleware(AdminGate())
-    udp, adp = Dispatcher(), Dispatcher()
-    udp.include_router(ur); adp.include_router(ar)
-    await asyncio.gather(udp.start_polling(ub), adp.start_polling(ab), news_loop())
+
+    init_db()
+
+    if not TOKEN_USER:
+
+        raise RuntimeError(
+            "Не задан GitHub Secret TOKEN_USER"
+        )
+
+    if not TOKEN_ADMIN:
+
+        raise RuntimeError(
+            "Не задан GitHub Secret TOKEN_ADMIN"
+        )
+
+    user_bot = Bot(token=TOKEN_USER)
+
+    admin_bot = Bot(token=TOKEN_ADMIN)
+
+    try:
+
+        user_info, admin_info = await asyncio.gather(
+            user_bot.get_me(),
+            admin_bot.get_me()
+        )
+
+        log.info(
+            "Пользовательский бот: @%s",
+            user_info.username
+        )
+
+        log.info(
+            "Административный бот: @%s",
+            admin_info.username
+        )
+
+        log.info(
+            "QUANTUM TRADE AI успешно запущен."
+        )
+
+        # Проверяем, что пользовательский бот является администратором канала.
+        try:
+            member = await user_bot.get_chat_member(
+                SOURCE_CHANNEL_ID,
+                user_info.id
+            )
+            log.info(
+                "Статус бота в SIGNALS PRO: %s",
+                member.status
+            )
+        except TelegramAPIError:
+            log.exception(
+                "Не удалось проверить доступ к SIGNALS PRO. "
+                "Проверьте ID канала и права бота."
+            )
+
+        await asyncio.gather(
+            user_dp.start_polling(user_bot),
+            admin_dp.start_polling(admin_bot)
+        )
+
+    finally:
+
+        await user_bot.session.close()
+        await admin_bot.session.close()
+
 
 if __name__ == "__main__":
+
     asyncio.run(main())
