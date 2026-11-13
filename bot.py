@@ -5,6 +5,8 @@ import sqlite3
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
@@ -205,7 +207,9 @@ main_keyboard = ReplyKeyboardMarkup(
 
 
 def colored_button(text, callback_data, style="primary"):
-    return InlineKeyboardButton(text=text, callback_data=callback_data, style=style)
+    # aiogram 3.13.1 does not support Telegram inline button colors.
+    # The style argument is retained for compatibility with existing calls.
+    return InlineKeyboardButton(text=text, callback_data=callback_data)
 
 
 def settings_keyboard(enabled):
@@ -296,45 +300,54 @@ async def show_main_menu(message):
 async def start_handler(message: Message):
     if not message.from_user:
         return
+
     register_user(message.from_user)
+
     if not await check_user(message):
         return
 
+    # 1. First message: the user's supplied animated intro GIF, without a caption.
     try:
         if INTRO_GIF_FILE_ID:
-            await message.answer_animation(
-                INTRO_GIF_FILE_ID, caption="💠 <b>QUANTUM TRADE AI</b>"
-            )
+            await message.answer_animation(INTRO_GIF_FILE_ID)
         elif os.path.isfile(INTRO_GIF_PATH):
-            await message.answer_animation(
-                FSInputFile(INTRO_GIF_PATH), caption="💠 <b>QUANTUM TRADE AI</b>"
-            )
+            await message.answer_animation(FSInputFile(INTRO_GIF_PATH))
         else:
             log.warning("Intro GIF not found: %s", INTRO_GIF_PATH)
     except TelegramAPIError:
         log.exception("Could not send intro GIF")
 
-    await message.answer(
-        "⚡ <b>QUANTUM TRADE AI</b>\n\n"
-        "<b>Добро пожаловать в интеллектуальную торговую платформу!</b>\n\n"
-        "Хотите получать торговые сигналы?"
+    # 2. Second message: the agreed welcome text.
+    welcome_text = (
+        "⚡ <b>QUANTUM TRADE AI</b>\\n\\n"
+        "<b>Добро пожаловать в мир интеллектуальной торговли!</b> ✨\\n\\n"
+        "Мы анализируем рынок за вас, используя современные алгоритмы "
+        "искусственного интеллекта, чтобы помочь вам принимать более "
+        "взвешенные торговые решения.\\n\\n"
+        "📊 <b>Хотите получать торговые сигналы и следить за "
+        "возможностями рынка вместе с QUANTUM TRADE AI?</b>"
     )
 
     user = get_user(message.from_user.id)
     consent = user[7] if user and len(user) > 7 else -1
+
+    # Existing choice is remembered: don't ask again after every /start.
     if consent in (0, 1):
-        status = "🟢 СИГНАЛЫ ВКЛЮЧЕНЫ" if consent == 1 else "🔴 СИГНАЛЫ ОТКЛЮЧЕНЫ"
+        await message.answer(welcome_text)
+        status = (
+            "🟢 <b>Получение сигналов включено.</b>"
+            if consent == 1
+            else "🔴 <b>Получение сигналов отключено.</b>"
+        )
         await message.answer(status, reply_markup=main_keyboard)
         return
 
+    # 3. Consent buttons are attached directly to the welcome message.
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [colored_button("✅ ПРИНЯТЬ", "signals_accept", "success")],
-        [colored_button("❌ ОТКЛОНИТЬ", "signals_decline", "danger")],
+        [colored_button("🟢 ✅ ПРИНЯТЬ", "signals_accept", "success")],
+        [colored_button("🔴 ❌ ОТКЛОНИТЬ", "signals_decline", "danger")],
     ])
-    await message.answer(
-        "🔔 <b>Выберите, хотите ли вы получать сигналы.</b>",
-        reply_markup=keyboard,
-    )
+    await message.answer(welcome_text, reply_markup=keyboard)
 
 
 @user_dp.callback_query(F.data.in_({"signals_accept", "signals_decline"}))
@@ -1295,8 +1308,8 @@ async def main():
     if not TOKEN_ADMIN:
         raise RuntimeError("Не задан GitHub Secret TOKEN_ADMIN")
 
-    user_bot = Bot(token=TOKEN_USER)
-    admin_bot = Bot(token=TOKEN_ADMIN)
+    user_bot = Bot(token=TOKEN_USER, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    admin_bot = Bot(token=TOKEN_ADMIN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     try:
         user_info, admin_info = await asyncio.gather(
